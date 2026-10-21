@@ -1,0 +1,66 @@
+@mode(host.scripted)
+
+# parallel's input generator: the value tuples of the jobs, one at a time,
+# from the input sources of the command line.
+#
+# Runtime: host.scripted. A module of the script bin/parallel.lpscr,
+# interpreted with it by `loup run`; tests/inputs_test.lpscr runs it under
+# Stage0's test runner (async generators and spawnBlocking are script
+# features). The scheduler consumes it with `for await`; Stage0 runs it
+# lazily, as specified, while the self-hosted `loup run` of 1.26 runs it to
+# its end before the loop's first pass, which gives the same tuples.
+
+from system.regex import (Regex);
+from .args import (SourceSpec, Origin);
+from .records import (split_records, expand_columns, link_groups, tuple_count, tuple_at);
+
+# How input records are cut and filtered (-0, -r, --colsep, --link).
+pub struct InputRules {
+    pub delimiter: string;
+    pub skip_empty: bool;
+    pub colsep: string;
+    pub link_all: bool;
+}
+
+pub func input_rules(delimiter: string, skip_empty: bool, colsep: string, link_all: bool): InputRules {
+    return InputRules(delimiter = delimiter, skip_empty = skip_empty, colsep = colsep, link_all = link_all);
+}
+
+# The whole text of an input file; "-" is standard input.
+func read_input(path: string): string {
+    return readText(if (path == "-") { "/dev/stdin" } else { path });
+}
+
+# The values of every job: one tuple per combination of the sources (or per
+# position, for linked sources), split into columns with --colsep.
+pub async gen func argument_tuples(sources: list[SourceSpec], rules: InputRules): AsyncIterable[list[string]] {
+    var values: list[list[string]] = [];
+    var linked: list[bool] = [];
+    for (source in sources) {
+        match source.origin {
+            Origin.Values(items) => { values.push(items); },
+            Origin.File(path) => {
+                # Reading blocks; spawnBlocking hands it to the blocking pool
+                # so that other tasks could run meanwhile (in 1.26 it runs
+                # at the call site).
+                let text = await spawnBlocking(func() => read_input(path));
+                values.push(split_records(text, rules.delimiter, rules.skip_empty));
+            },
+        }
+        linked.push(source.linked);
+    }
+    var lengths: list[int] = [];
+    for (v in values) {
+        lengths.push(v.len());
+    }
+    let groups = link_groups(linked, rules.link_all);
+    let count = tuple_count(lengths, groups);
+    let splitter: Regex? = if (rules.colsep == "") { None } else { Some(Regex(rules.colsep)) };
+    for (k in 0..count) {
+        let tuple = tuple_at(values, groups, k);
+        match splitter {
+            Some(rx) => { yield expand_columns(tuple, rx); },
+            None => { yield tuple; },
+        }
+    }
+}

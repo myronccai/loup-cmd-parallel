@@ -1,0 +1,56 @@
+@mode(host.scripted)
+
+# Unit tests for parallel's launcher worker (lib/launcher.lpscr), imported
+# as an ordinary module: the argv it runs and starting real jobs.
+#
+# Runtime: host.scripted, run by the test runner: `make test` interprets
+# this file with Stage0 (`loup-bootstrap test --no-color --no-parallel
+# --file`), one test per `func test_*()`. Stage0's test runner cannot run
+# `spawnWorker`, so the tests call start_job directly; the jobs run with
+# `sh` in a spool directory under $TMPDIR or /tmp, removed afterwards. It
+# is not part of the program.
+
+from debug.assert import (expect, expectEq);
+from core.time import (Duration);
+from core.waiting import (waitForItSync, WaitContext);
+from ..lib.launcher import (job_wrapper, starter, launch_argv, escape_argv, start_job);
+from ..lib.shell import (detect_shell, make_spool, remove_spool);
+
+# Starts `command` as job 1 in a new spool; returns the spool once the job
+# has published its status.
+func run_job(command: string): string {
+    let shell = detect_shell();
+    let spool = make_spool(shell, "").unwrap();
+    let rewrites = if (shell.rewrites_arguments) { "1" } else { "0" };
+    let reply = start_job(["1", "2", spool, command, rewrites, "0"]);
+    expect(reply[0] == "1" and reply[1].toInt() > 0 and reply[2] == "", "started: " + reply.join(" "));
+    waitForItSync(func(edits ctx: WaitContext): bool { return exists(spool + "/1.rc"); },
+        "job 1", Duration.ofSeconds(0), Duration.ofMillis(10), Duration.ofSeconds(10));
+    return spool;
+}
+
+func test_launch_argv(): void {
+    let argv = launch_argv("/tmp/p.1", "7", "2", true);
+    expectEq(argv.len(), 9, "sh -c STARTER and six positional words");
+    expectEq(argv.slice(3).join(" ").slice(0, 16), "parallel setsid ", "$0 and the setsid prefix");
+    expectEq(argv.slice(6).join(" "), "/tmp/p.1 7 2", "spool, sequence, slot");
+    expectEq(launch_argv("/s", "1", "1", false)[4], "", "no setsid: the prefix expands to nothing");
+    expect(starter().endsWith("& echo $!") and job_wrapper().contains("mv \"$1/$2.tmp\" \"$1/$2.rc\""), "snippets");
+    expectEq(escape_argv(["a\"$`\\b", "c"]).join(" "), "a\\\"\\$\\`\\\\b c", "escape");
+}
+
+func test_job_output_status_and_environment(): void {
+    let spool = run_job("echo \"$PARALLEL_SEQ/$PARALLEL_JOBSLOT\"; echo oops >&2; exit 4");
+    expectEq(readText(spool + "/1.rc").trim(), "4", "exit status");
+    expectEq(readText(spool + "/1.out") + readText(spool + "/1.err"), "1/2\noops\n", "output and environment");
+    expect(!exists(spool + "/1.tmp"), "the temporary status file was renamed");
+    remove_spool(detect_shell(), spool);
+}
+
+func test_command_reaches_the_shell_intact(): void {
+    let command = "printf '%s\\n' \"$HOME\" | wc -l; echo 'a  b' `echo c`";
+    let spool = run_job(command);
+    expectEq(readText(spool + "/1.cmd"), command + "\n", "the command file");
+    expectEq(readText(spool + "/1.out"), "1\na  b c\n", "quotes and substitutions");
+    remove_spool(detect_shell(), spool);
+}

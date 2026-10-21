@@ -1,0 +1,110 @@
+@mode(host.scripted)
+
+# Unit tests for parallel's job bookkeeping (lib/runner.lpscr): the job log
+# and its mutex, the collector and its counters, and the stopper on real
+# process groups.
+#
+# Runtime: host.scripted, run by the test runner: `make test` interprets
+# this file with Stage0 (`loup-bootstrap test --no-color --no-parallel
+# --file`), one test per `func test_*()`. The tests write spool
+# directories under $TMPDIR or /tmp and job logs under .temp/, and start
+# `sleep` jobs; the stopper test is skipped where `setsid` is missing. It
+# is not part of the program.
+
+from debug.assert import (expect, expectEq);
+from testing import (skipTest);
+from io.fs import (createDir, writeText);
+from system.time import (monotonicNs);
+from core.time import (Duration);
+from core.waiting import (waitForItSync, WaitContext);
+from ..lib.results import (Job, JobResult, new_job, job_started, job_result);
+from ..lib.runner import (Tally, JobLog, Collector, Stopper, open_joblog, spool_file, job_finished);
+from ..lib.shell import (Shell, detect_shell, make_spool, remove_spool);
+from ..lib.launcher import (start_job);
+
+func sample(seq: int): JobResult {
+    return job_result(job_started(new_job(seq, 1, ["x"], "cmd"), 1, 0, 0, 0), seq % 2, 0, "out\n", "", 0);
+}
+
+# Starts `command` as job `seq` the way the launcher worker does.
+func launch(shell: Shell, spool: string, seq: int, command: string): Job {
+    let flags: list[string] = [if (on) { "1" } else { "0" } for on in [shell.rewrites_arguments, shell.has_setsid]];
+    let reply = start_job([str(seq), "1", spool, command, flags[0], flags[1]]);
+    return job_started(new_job(seq, 1, ["x"], command), reply[1].toInt(), 0, monotonicNs(), 0);
+}
+
+func wait_until(what: string, condition: fn(): bool): void {
+    waitForItSync(func(edits ctx: WaitContext): bool { return condition(); },
+        what, Duration.ofSeconds(0), Duration.ofMillis(10), Duration.ofSeconds(10));
+}
+
+func test_joblog_from_threads(): void {
+    createDir(".temp/tests");
+    let log = open_joblog(".temp/tests/log.tsv").unwrap();
+    var handles: list[ThreadHandle[int]] = [];
+    for (seq in [1, 2, 3, 4]) {
+        handles.push(Thread.spawnWith(func(): int {
+            log.record(sample(seq));
+            return seq;
+        }));
+    }
+    var total = 0;
+    for (h in handles) {
+        total += h.join();
+    }
+    expectEq(total, 10, "every thread ran");
+    expectEq(log.written(), 4, "lines counted under the mutex");
+    let lines = readText(".temp/tests/log.tsv").split("\n");
+    expect(lines.len() == 6 and lines[0].startsWith("Seq\tHost"), "the header and whole lines");
+    expect(lines[1].endsWith("\t0\t4\t1\t0\tcmd") or lines[1].endsWith("\t0\t4\t0\t0\tcmd"), "a job line");
+}
+
+func test_joblog_errors(): void {
+    expectEq(open_joblog("/nonexistent/log").unwrap_err(), "cannot write the job log '/nonexistent/log': No such file or directory", "missing directory");
+    createDir(".temp/tests/adir");
+    expectEq(open_joblog(".temp/tests/adir").unwrap_err(), "cannot write the job log '.temp/tests/adir': Is a directory", "a directory");
+    expectEq(open_joblog("").unwrap().path, "", "no job log");
+}
+
+func test_collector(): void {
+    let shell = detect_shell();
+    let spool = make_spool(shell, "").unwrap();
+    writeText(spool_file(spool, 4, "cmd"), "echo hi\n");
+    writeText(spool_file(spool, 4, "out"), "hi\n");
+    writeText(spool_file(spool, 4, "err"), "warn\n");
+    writeText(spool_file(spool, 4, "rc"), "2\n");
+    expect(job_finished(spool, 4), "finished");
+    let tally = Tally();
+    let collector = Collector(spool, JobLog(""), tally);
+    let r = collector.collect(job_started(new_job(4, 1, ["x"], "echo hi"), 1, 0, 0, 0), 0);
+    expectEq(str(r.exitval) + " " + r.out + r.err, "2 hi\nwarn\n", "status and output");
+    expect(!exists(spool_file(spool, 4, "rc")) and !exists(spool_file(spool, 4, "cmd")), "files removed");
+    let stopped = collector.collect(job_started(new_job(5, 1, ["y"], "sleep"), 1, 0, 0, 0), 15);
+    expectEq(str(stopped.exitval) + " " + str(stopped.signal), "-1 15", "a stopped job");
+    expectEq(tally.failed.load() + tally.succeeded.load() * 10, 2, "both counted as failed");
+    remove_spool(shell, spool);
+}
+
+func test_stopper(): void {
+    let shell = detect_shell();
+    if (!shell.has_setsid) {
+        skipTest("setsid is not installed");
+    }
+    let spool = make_spool(shell, "").unwrap();
+    let tally = Tally();
+    let stopper = Stopper(shell, spool, tally);
+    let sleeper = launch(shell, spool, 1, "sleep 30");
+    expectEq(stopper.stop(sleeper), 15, "TERM is enough");
+    expect(!shell.job_alive(sleeper.pid), "gone");
+    let stubborn = launch(shell, spool, 2, "trap '' TERM; echo ready; sleep 30");
+    let out = spool_file(spool, 2, "out");
+    # Stop it only once the trap is set.
+    wait_until("job 2 to start", func(): bool { return exists(out) and readText(out) == "ready\n"; });
+    expectEq(stopper.stop(stubborn), 9, "KILL after the grace period");
+    expect(!shell.job_alive(stubborn.pid), "gone too");
+    let quick = launch(shell, spool, 3, "true");
+    wait_until("job 3", func(): bool { return job_finished(spool, 3); });
+    expectEq(stopper.stop(quick), 0, "a finished job is left alone");
+    expectEq(tally.stopped.load(), 2, "two stopped");
+    remove_spool(shell, spool);
+}

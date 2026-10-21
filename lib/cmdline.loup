@@ -1,0 +1,122 @@
+@mode(host.dual)
+
+# parallel's command templates: the replacement strings ({}, {.}, {/}, {//},
+# {/.}, {#}, {%}, {N}, {N.} ...) and building a job's command line.
+#
+# Runtime: host.dual, but only ever interpreted here: lib/scheduler.lpscr
+# imports it under `loup run`, tests/cmdline_test.lpscr under Stage0's test
+# runner. core.shlex and io.path are written in Loup, so it stays compilable.
+
+from core.shlex import (quote);
+from io.path import (basename, dirname, splitExt);
+
+# The values of one job and its numbers. `quote_values` is false under -q,
+# where whole words are quoted instead.
+pub struct Fill {
+    pub values: list[string];
+    pub seq: int;
+    pub slot: int;
+    pub quote_values: bool;
+}
+
+pub func make_fill(values: list[string], seq: int, slot: int, quote_values: bool): Fill {
+    return Fill(values = values, seq = seq, slot = slot, quote_values = quote_values);
+}
+
+# A value seen through a suffix: "" (as is), "." (no extension), "/"
+# (basename), "//" (directory), "/." (basename without extension).
+func transform(value: string, suffix: string): string? {
+    return match suffix {
+        "" => Some(value),
+        "." => Some(splitExt(value)[0]),
+        "/" => Some(basename(value)),
+        "//" => Some(dirname(value)),
+        "/." => Some(splitExt(basename(value))[0]),
+        _ => None,
+    };
+}
+
+func shell_text(text: string, fill: Fill): string {
+    return if (fill.quote_values) { quote(text) } else { text };
+}
+
+# Every value transformed by `suffix`, quoted, joined by spaces.
+func all_values(fill: Fill, suffix: string): string {
+    let parts: list[string] = [shell_text(transform(v, suffix) ?? v, fill) for v in fill.values];
+    return parts.join(" ");
+}
+
+# What `{inner}` stands for, or None when it is not a replacement string:
+# awk's `{print $1}`, or `{3}` for a job with two values, stay as written.
+func replacement_for(inner: string, fill: Fill): string? {
+    if (inner == "#") {
+        return Some(str(fill.seq));
+    }
+    if (inner == "%") {
+        return Some(str(fill.slot));
+    }
+    if (transform("", inner) != None) {
+        return Some(all_values(fill, inner));
+    }
+    # {N} and {N.}, {N/}, {N//}, {N/.}: digits, then a suffix.
+    var digits = 0;
+    while (digits < inner.len() and "0123456789".contains(inner.slice(digits, digits + 1))) {
+        digits += 1;
+    }
+    let n = if (digits == 0) { 0 } else { inner.slice(0, digits).toInt() };
+    if (n < 1 or n > fill.values.len()) {
+        return None;
+    }
+    match transform(fill.values[n - 1], inner.slice(digits)) {
+        Some(text) => { return Some(shell_text(text, fill)); },
+        None => { return None; },
+    }
+}
+
+# A command word with its replacement strings filled in, and whether it had
+# any.
+pub func expand_word(word: string, fill: Fill): (string, bool) {
+    var out = "";
+    var found = false;
+    var i = 0;
+    while (i < word.len()) {
+        let ch = word.slice(i, i + 1);
+        let close = if (ch == "{") { word.slice(i).index_of("}") } else { -1 };
+        if (close > 0) {
+            match replacement_for(word.slice(i + 1, i + close), fill) {
+                Some(text) => {
+                    out += text;
+                    found = true;
+                    i += close + 1;
+                    continue;
+                },
+                None => {},
+            }
+        }
+        out += ch;
+        i += 1;
+    }
+    return (out, found);
+}
+
+# The shell command line of one job. Without a command the values are the
+# command; without a replacement string they are appended to it, quoted.
+# Under -q (`quote_words`) every finished word is quoted as a whole.
+pub func build_command(words: list[string], fill: Fill, quote_words: bool): string {
+    if (words.len() == 0) {
+        return fill.values.join(" ");
+    }
+    var parts: list[string] = [];
+    var found = false;
+    for (word in words) {
+        let (text, here) = expand_word(word, fill);
+        found = found or here;
+        parts.push(if (quote_words) { quote(text) } else { text });
+    }
+    if (!found) {
+        for (value in fill.values) {
+            parts.push(quote(value));
+        }
+    }
+    return parts.join(" ");
+}

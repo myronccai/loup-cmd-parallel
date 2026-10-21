@@ -1,0 +1,292 @@
+@mode(host.dual)
+
+# parallel's command-line parser, written by hand (Loup 1.26 has no CLI
+# library).
+#
+# Grammar: parallel [OPTION]... [COMMAND [ARG]...] [SEPARATOR ITEM...]...
+#   Options end at the first word that is not one, or at `--`. Short options
+#   combine (`-kv`) and take a value attached or as the next word (`-j4`,
+#   `-j 4`); long ones take `--name VALUE` or `--name=VALUE`. The command
+#   runs up to the first separator: `:::` (arguments), `::::` (argument
+#   files), `:::+`/`::::+` (the same, linked to the source before).
+#
+# Runtime: host.dual, but only ever interpreted here: bin/parallel.lpscr
+# imports it under `loup run`, tests/args_test.lpscr under Stage0's test
+# runner. system.regex (for --colsep) is written in Loup, so it stays
+# compilable.
+
+from system.regex import (Regex);
+from .appinfo import (MAX_SLOTS);
+from .halt import (HaltPolicy, never_halt, parse_halt);
+from .numbers import (parse_whole, parse_millis);
+
+# Where the values of one input source come from.
+pub enum Origin {
+    Values(list[string]),
+    File(string),
+}
+
+# One input source. A `linked` source is read side by side with the source
+# before it instead of being combined with it.
+pub struct SourceSpec {
+    pub origin: Origin;
+    pub linked: bool;
+}
+
+pub struct Options {
+    pub var help: bool;
+    pub var version: bool;
+    pub var jobs: string;
+    pub var keep_order: bool;
+    pub var halt: HaltPolicy;
+    pub var joblog: string;
+    pub var dry_run: bool;
+    pub var tag: bool;
+    pub var print_command: bool;
+    pub var verbose: bool;
+    pub var quote: bool;
+    pub var delimiter: string;
+    pub var colsep: string;
+    pub var skip_empty: bool;
+    pub var link: bool;
+    pub var timeout_ms: int;
+    pub var tmpdir: string;
+    pub var command: list[string];
+    pub var sources: list[SourceSpec];
+}
+
+pub func default_options(): Options {
+    return Options(help = false, version = false, jobs = "100%", keep_order = false,
+        halt = never_halt(), joblog = "", dry_run = false, tag = false, print_command = false,
+        verbose = false, quote = false, delimiter = "\n", colsep = "", skip_empty = false,
+        link = false, timeout_ms = 0, tmpdir = "", command = [], sources = []);
+}
+
+pub func values_source(values: list[string], linked: bool): SourceSpec {
+    return SourceSpec(origin = Origin.Values(values), linked = linked);
+}
+
+pub func file_source(path: string, linked: bool): SourceSpec {
+    return SourceSpec(origin = Origin.File(path), linked = linked);
+}
+
+# The long name of a short option letter, or "".
+func long_for_short(letter: string): string {
+    return match letter {
+        "j" => "--jobs",
+        "P" => "--jobs",
+        "k" => "--keep-order",
+        "v" => "-v",
+        "t" => "--verbose",
+        "q" => "--quote",
+        "a" => "--arg-file",
+        "0" => "--null",
+        "C" => "--colsep",
+        "r" => "--no-run-if-empty",
+        "h" => "--help",
+        "V" => "--version",
+        _ => "",
+    };
+}
+
+# The canonical spelling of a long option (aliases folded), or "".
+func canonical_long(name: string): string {
+    let names = ["--jobs", "--keep-order", "--halt", "--joblog", "--dry-run", "--tag", "--verbose",
+        "--quote", "--arg-file", "--null", "--colsep", "--no-run-if-empty", "--link", "--timeout",
+        "--tmpdir", "--help", "--version"];
+    return match name {
+        "--max-procs" => "--jobs",
+        "--halt-on-error" => "--halt",
+        "--xapply" => "--link",
+        _ => if (names.contains(name)) { name } else { "" },
+    };
+}
+
+func takes_value(name: string): bool {
+    return ["--jobs", "--halt", "--joblog", "--arg-file", "--colsep", "--timeout", "--tmpdir"].contains(name);
+}
+
+pub func is_separator(word: string): bool {
+    return word == ":::" or word == ":::+" or word == "::::" or word == "::::+";
+}
+
+# The number of job slots a --jobs value gives with `cpus` processors: N,
+# +N (cpus + N), -N (cpus - N) or N% (of cpus), at least one; 0 means as
+# many as possible.
+pub func resolve_jobs(spec: string, cpus: int): Result[int, string] {
+    var kind = "=";
+    var digits = spec;
+    if (spec.startsWith("+") or spec.startsWith("-")) {
+        kind = spec.slice(0, 1);
+        digits = spec.slice(1);
+    } else if (spec.endsWith("%")) {
+        kind = "%";
+        digits = spec.slice(0, spec.len() - 1);
+    }
+    let n = parse_whole(digits) ?? -1;
+    if (n < 0) {
+        return Err(i"invalid --jobs value '{$ spec $}'");
+    }
+    var slots = match kind {
+        "+" => cpus + n,
+        "-" => cpus - n,
+        "%" => cpus * n / 100,
+        _ => if (n == 0) { MAX_SLOTS } else { n },
+    };
+    if (slots < 1) {
+        slots = 1;
+    }
+    return Ok(if (slots > MAX_SLOTS) { MAX_SLOTS } else { slots });
+}
+
+# Checks one option's value and stores it in `o`. `name` is canonical.
+func apply_option(edits o: Options, name: string, value: string): Result[bool, string] {
+    match name {
+        "--jobs" => {
+            resolve_jobs(value, 1)?;
+            o.jobs = value;
+        },
+        "--keep-order" => { o.keep_order = true; },
+        "--halt" => { o.halt = parse_halt(value)?; },
+        "--joblog" => { o.joblog = value; },
+        "--dry-run" => { o.dry_run = true; },
+        "--tag" => { o.tag = true; },
+        "-v" => { o.print_command = true; },
+        "--verbose" => { o.verbose = true; },
+        "--quote" => { o.quote = true; },
+        "--arg-file" => { o.sources.push(file_source(value, false)); },
+        "--null" => { o.delimiter = str(char.of(0)); },
+        "--colsep" => {
+            if (value.len() == 0 or Regex.compile(value).is_err()) {
+                return Err(i"invalid --colsep regular expression '{$ value $}'");
+            }
+            o.colsep = value;
+        },
+        "--no-run-if-empty" => { o.skip_empty = true; },
+        "--link" => { o.link = true; },
+        "--timeout" => {
+            match parse_millis(value) {
+                Some(ms) if (ms > 0) => { o.timeout_ms = ms; },
+                _ => { return Err(i"invalid --timeout value '{$ value $}'"); },
+            }
+        },
+        "--tmpdir" => { o.tmpdir = value; },
+        "--help" => { o.help = true; },
+        "--version" => { o.version = true; },
+        _ => { return Err(i"unhandled option {$ name $}"); },
+    }
+    return Ok(true);
+}
+
+# Reads the options at the start of argv into `o`; returns the index of the
+# first word after them (the command), or a usage error.
+func parse_options(argv: list[string], edits o: Options): Result[int, string] {
+    var i = 0;
+    while (i < argv.len()) {
+        let word = argv[i];
+        if (word == "--") {
+            return Ok(i + 1);
+        }
+        if (is_separator(word) or !word.startsWith("-") or word == "-") {
+            return Ok(i);
+        }
+        if (word.startsWith("--")) {
+            let eq = word.index_of("=");
+            let given = if (eq < 0) { word } else { word.slice(0, eq) };
+            let name = canonical_long(given);
+            if (name == "") {
+                return Err(i"unrecognized option '{$ word $}'");
+            }
+            if (!takes_value(name) and eq >= 0) {
+                return Err(i"option '{$ given $}' doesn't allow an argument");
+            }
+            var value = "";
+            if (eq >= 0) {
+                value = word.slice(eq + 1);
+            } else if (takes_value(name)) {
+                if (i + 1 >= argv.len()) {
+                    return Err(i"option '{$ given $}' requires an argument");
+                }
+                i += 1;
+                value = argv[i];
+            }
+            apply_option(edits: o, name, value)?;
+            i += 1;
+            continue;
+        }
+        # A cluster of short flags, possibly ending in an option whose value
+        # is the rest of the word or the next word.
+        var k = 1;
+        while (k < word.len()) {
+            let letter = word.slice(k, k + 1);
+            let name = long_for_short(letter);
+            if (name == "") {
+                return Err(i"invalid option -- '{$ letter $}'");
+            }
+            if (!takes_value(name)) {
+                apply_option(edits: o, name, "")?;
+                k += 1;
+                continue;
+            }
+            if (k + 1 < word.len()) {
+                apply_option(edits: o, name, word.slice(k + 1))?;
+            } else if (i + 1 < argv.len()) {
+                i += 1;
+                apply_option(edits: o, name, argv[i])?;
+            } else {
+                return Err(i"option requires an argument -- '{$ letter $}'");
+            }
+            break;
+        }
+        i += 1;
+    }
+    return Ok(i);
+}
+
+pub func parse_args(argv: list[string]): Result[Options, string] {
+    var o = default_options();
+    var i = parse_options(argv, edits: o)?;
+    # The command: every word up to the first separator.
+    while (i < argv.len() and !is_separator(argv[i])) {
+        o.command.push(argv[i]);
+        i += 1;
+    }
+    # The input sources: each separator with the words up to the next one.
+    while (i < argv.len()) {
+        let separator = argv[i];
+        i += 1;
+        var items: list[string] = [];
+        while (i < argv.len() and !is_separator(argv[i])) {
+            items.push(argv[i]);
+            i += 1;
+        }
+        let linked = separator.endsWith("+");
+        if (!separator.startsWith("::::")) {
+            o.sources.push(values_source(items, linked));
+            continue;
+        }
+        if (items.len() == 0) {
+            return Err(i"missing file name after '{$ separator $}'");
+        }
+        for (path in items) {
+            o.sources.push(file_source(path, linked));
+        }
+    }
+    # No source at all: the inputs are the lines of standard input.
+    if (o.sources.len() == 0) {
+        o.sources.push(file_source("-", false));
+    }
+    return Ok(o);
+}
+
+# The files the run will read (standard input as "-"), in source order.
+pub func input_files(o: Options): list[string] {
+    var files: list[string] = [];
+    for (source in o.sources) {
+        match source.origin {
+            Origin.File(path) => { files.push(path); },
+            Origin.Values(_) => {},
+        }
+    }
+    return files;
+}

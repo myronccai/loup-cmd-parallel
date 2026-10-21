@@ -1,0 +1,74 @@
+@mode(host.scripted)
+
+# Unit tests for parallel's process helpers (lib/shell.lpscr): the argument
+# escape, running commands, the CPU count, the spool directory and
+# signalling a process group.
+#
+# Runtime: host.scripted, run by the test runner: `make test` interprets
+# this file with Stage0 (`loup-bootstrap test --no-color --no-parallel
+# --file`), one test per `func test_*()`. The tests start real processes
+# and create spool directories under $TMPDIR or /tmp, which they remove;
+# the signal test is skipped where `setsid` is missing. It is not part of
+# the program.
+
+from debug.assert import (expect, expectEq);
+from testing import (skipTest);
+from io.fs import (isDir, writeText, remove, listDir);
+from system.time import (sleepNs);
+from ..lib.shell import (Shell, escape_for_double_quotes, detect_shell, cpu_count, make_spool, is_spool_file,
+    remove_spool);
+
+func test_escape(): void {
+    expectEq(escape_for_double_quotes("a\"b $x `y` it's"), "a\\\"b \\$x \\`y\\` it's", "the four special characters");
+    expectEq(escape_for_double_quotes("\\$"), "\\\\\\$", "backslash first");
+    let argv = ["printf", "%s", "$x"];
+    expectEq(Shell(false, true).prepare(argv).join(" "), "printf %s $x", "Stage0 passes arguments as they are");
+    expectEq(Shell(true, true).prepare(argv).join(" "), "printf %s \\$x", "self-hosted gets the escape");
+}
+
+# Whatever runtime runs the test, arguments reach the command unchanged.
+func test_arguments_round_trip(): void {
+    let shell = detect_shell();
+    for (text in ["$HOME", "a  b", "q\"q", "back`tick`", "\\n", "it's", "semi;colon", ""]) {
+        expectEq(shell.output(["printf", "[%s]", text]) ?? "failed", "[" + text + "]", "printf " + text);
+    }
+    expect(shell.output(["false"]) == None, "a failing command has no output");
+    expectEq(shell.status(["sh", "-c", "exit 4"]), 4, "exit status");
+    expect(cpu_count(shell) >= 1, "at least one CPU");
+}
+
+func test_spool(): void {
+    expect(is_spool_file("12.out") and is_spool_file("3.rc") and !is_spool_file("1.log"), "job files");
+    expect(!is_spool_file("notes.txt") and !is_spool_file(".out"), "other files");
+    let shell = detect_shell();
+    let spool = make_spool(shell, "").unwrap();
+    expect(isDir(spool) and spool.contains("/parallel."), "created");
+    writeText(spool + "/1.out", "x");
+    writeText(spool + "/keep.me", "mine");
+    remove_spool(shell, spool);
+    expectEq(listDir(spool).join(","), "keep.me", "only job files go; rmdir refuses the rest");
+    remove(spool + "/keep.me");
+    remove_spool(shell, spool);
+    expect(!exists(spool), "removed");
+    expectEq(make_spool(shell, "/nonexistent/dir").unwrap_err(),
+        "cannot keep temporary files in '/nonexistent/dir': not a directory", "no such directory");
+}
+
+func test_signal_process_group(): void {
+    let shell = detect_shell();
+    if (!shell.has_setsid) {
+        skipTest("setsid is not installed");
+    }
+    # A process group of a shell and its sleep, as the launcher makes them.
+    let started = shell.output(["sh", "-c", "setsid sh -c 'sleep 30; true' > /dev/null 2>&1 < /dev/null & echo $!"]) ?? "";
+    let pid = started.trim().toInt();
+    expect(pid > 0 and shell.job_alive(pid), "started");
+    expect(shell.signal_job(pid, "TERM"), "signalled");
+    var waited = 0;
+    while (shell.job_alive(pid) and waited < 50) {
+        sleepNs(10000000);
+        waited += 1;
+    }
+    expect(!shell.job_alive(pid), "the whole group is gone");
+    expect(!shell.signal_job(pid, "TERM"), "nothing left to signal");
+}

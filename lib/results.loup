@@ -1,0 +1,153 @@
+@mode(host.dual)
+
+# parallel's jobs and their results: the records the scheduler keeps, the
+# output group printed for a finished job (--tag, -v), the job log line
+# (--joblog), and the buffer that restores input order (-k).
+#
+# Runtime: host.dual, but only ever interpreted here: lib/runner.lpscr and
+# lib/scheduler.lpscr import it under `loup run`, and tests/results_test.lpscr
+# under Stage0's test runner. Structs, a class and pure functions.
+
+from .numbers import (seconds3, pad_left);
+
+# A job as the scheduler tracks it. Times are nanoseconds: `start_ns` on the
+# wall clock (for the job log), `start_mono` and `deadline_mono` on the
+# monotonic clock (run time, --timeout; a deadline of 0 means none).
+pub struct Job {
+    pub seq: int;
+    pub slot: int;
+    pub values: list[string];
+    pub command: string;
+    pub pid: int;
+    pub start_ns: int;
+    pub start_mono: int;
+    pub deadline_mono: int;
+}
+
+# What became of a job. `exitval` is the shell's exit status, or -1 for a job
+# this program stopped; `signal` is then the signal that ended it.
+pub struct JobResult {
+    pub seq: int;
+    pub slot: int;
+    pub values: list[string];
+    pub command: string;
+    pub exitval: int;
+    pub signal: int;
+    pub out: string;
+    pub err: string;
+    pub start_ns: int;
+    pub runtime_ns: int;
+}
+
+pub func new_job(seq: int, slot: int, values: list[string], command: string): Job {
+    return Job(seq = seq, slot = slot, values = values, command = command, pid = 0,
+        start_ns = 0, start_mono = 0, deadline_mono = 0);
+}
+
+# The job once it runs as process group `pid`.
+pub func job_started(job: Job, pid: int, wall_ns: int, mono_ns: int, timeout_ms: int): Job {
+    let deadline = if (timeout_ms > 0) { mono_ns + timeout_ms * 1000000 } else { 0 };
+    return job with (pid = pid, start_ns = wall_ns, start_mono = mono_ns, deadline_mono = deadline);
+}
+
+pub func job_overdue(job: Job, now_mono: int): bool {
+    return job.deadline_mono > 0 and now_mono >= job.deadline_mono;
+}
+
+pub func job_result(job: Job, exitval: int, signal: int, out: string, err: string, end_mono: int): JobResult {
+    return JobResult(seq = job.seq, slot = job.slot, values = job.values, command = job.command,
+        exitval = exitval, signal = signal, out = out, err = err, start_ns = job.start_ns,
+        runtime_ns = end_mono - job.start_mono);
+}
+
+pub func job_failed(r: JobResult): bool {
+    return r.exitval != 0 or r.signal != 0;
+}
+
+# `text` with `prefix` before every line; a last line without a newline
+# gets one too, an empty text stays empty.
+func prefix_lines(text: string, prefix: string): string {
+    if (text.len() == 0) {
+        return "";
+    }
+    let lines = text.split("\n");
+    var out: list[string] = [];
+    for (k in 0..lines.len()) {
+        if (k == lines.len() - 1 and lines[k].len() == 0) {
+            break;
+        }
+        out.push(prefix + lines[k] + "\n");
+    }
+    return out.join("");
+}
+
+# The output group of a finished job: what goes to standard output and what
+# goes to standard error. -v (`show_command`) puts the command line first;
+# --tag starts every line with the job's values and a tab.
+pub func render_output(r: JobResult, tag: bool, show_command: bool): (string, string) {
+    var out = r.out;
+    if (show_command) {
+        out = r.command + "\n" + out;
+    }
+    if (!tag) {
+        return (out, r.err);
+    }
+    let prefix = r.values.join(" ") + "\t";
+    return (prefix_lines(out, prefix), prefix_lines(r.err, prefix));
+}
+
+pub func joblog_header(): string {
+    let names = ["Seq", "Host", "Starttime", "JobRuntime", "Send", "Receive", "Exitval", "Signal", "Command"];
+    return names.join("\t");
+}
+
+# One job log line, as GNU parallel writes it: the host is `:` (this
+# machine), nothing is sent, and Receive counts the output bytes.
+pub func joblog_line(r: JobResult): string {
+    let received = r.out.byteLength() + r.err.byteLength();
+    let fields = [str(r.seq), ":", seconds3(r.start_ns), pad_left(seconds3(r.runtime_ns), 10),
+        "0", str(received), str(r.exitval), str(r.signal), r.command];
+    return fields.join("\t");
+}
+
+# Releases results for printing: at once, or with -k in sequence order,
+# holding each result until all jobs before it have been printed.
+pub class OrderBuffer {
+    let keep_order: bool;
+    var next_seq: int = 1;
+    var held: dict[int, JobResult] = {};
+
+    new(keep_order: bool) {
+        this.keep_order = keep_order;
+    }
+
+    pub modifier func add(r: JobResult): list[JobResult] {
+        if (!this.keep_order) {
+            return [r];
+        }
+        this.held[r.seq] = r;
+        var ready: list[JobResult] = [];
+        while (this.held.containsKey(this.next_seq)) {
+            ready.push(this.held[this.next_seq]);
+            this.held.remove(this.next_seq);
+            this.next_seq += 1;
+        }
+        return ready;
+    }
+
+    # Everything still held, in sequence order: at the end of a halted run
+    # some earlier jobs never started, so their places stay empty.
+    pub modifier func flush(): list[JobResult] {
+        var seqs: list[int] = [];
+        for (seq in this.held.keys()) {
+            seqs.push(seq);
+        }
+        seqs.sort(func(a: int, b: int): int { return a - b; });
+        var ready: list[JobResult] = [];
+        for (seq in seqs) {
+            ready.push(this.held[seq]);
+            this.held.remove(seq);
+        }
+        return ready;
+    }
+}

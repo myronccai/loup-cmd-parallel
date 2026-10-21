@@ -1,0 +1,73 @@
+@mode(host.scripted)
+
+# Unit tests for parallel's jobs and results (lib/results.loup): job
+# records, output groups with --tag and -v, job log lines, the -k buffer.
+#
+# Runtime: host.scripted, run by the test runner: `make test` interprets
+# this file with Stage0 (`loup-bootstrap test --no-color --no-parallel
+# --file`), one test per `func test_*()`. It is not part of the program.
+
+from debug.assert import (expect, expectEq);
+from ..lib.results import (Job, JobResult, new_job, job_started, job_overdue, job_result, job_failed,
+    render_output, joblog_header, joblog_line, OrderBuffer);
+
+func result(seq: int, values: list[string], out: string, err: string): JobResult {
+    let job = job_started(new_job(seq, 1, values, "cmd " + str(seq)), 100, 1792562098374000000, 0, 0);
+    return job_result(job, 0, 0, out, err, 5000000);
+}
+
+func seqs(rs: list[JobResult]): string {
+    let parts: list[string] = [str(r.seq) for r in rs];
+    return parts.join(",");
+}
+
+func test_jobs(): void {
+    let job = new_job(3, 2, ["a", "b"], "echo a b");
+    let started = job_started(job, 4242, 10, 1000, 500);
+    expectEq(started.pid, 4242, "pid");
+    expectEq(job.pid, 0, "the original is unchanged");
+    expect(!job_overdue(started, 1000) and job_overdue(started, 1000 + 500 * 1000000), "deadline");
+    expect(!job_overdue(job_started(job, 1, 0, 0, 0), 999999999999), "no timeout");
+    let r = job_result(job_started(job, 9, 0, 1000, 0), 1, 0, "", "", 3000);
+    expectEq(r.runtime_ns, 2000, "run time");
+    expect(job_failed(r) and job_failed(job_result(job, -1, 15, "", "", 0)), "exit 1 and stopped jobs fail");
+    expect(!job_failed(job_result(job, 0, 0, "", "", 0)), "exit 0");
+}
+
+func test_output_groups(): void {
+    let r = result(1, ["a b"], "a b\n", "warn\n");
+    let (out, err) = render_output(r, false, false);
+    expectEq(out + err, "a b\nwarn\n", "as written");
+    let (shown, _) = render_output(r, false, true);
+    expectEq(shown, "cmd 1\na b\n", "-v puts the command first");
+    let (tagged, tagged_err) = render_output(result(2, ["x", "y"], "one\ntwo", "e\n"), true, false);
+    expectEq(tagged, "x y\tone\nx y\ttwo\n", "every line tagged, the last one ended");
+    expectEq(tagged_err, "x y\te\n", "stderr tagged");
+    let (empty, _) = render_output(result(3, ["z"], "", ""), true, false);
+    expectEq(empty, "", "no output, no tag");
+}
+
+func test_joblog(): void {
+    expectEq(joblog_header(), "Seq\tHost\tStarttime\tJobRuntime\tSend\tReceive\tExitval\tSignal\tCommand", "header");
+    expectEq(joblog_line(result(1, ["x"], "hello\n", "!\n")), "1\t:\t1792562098.374\t     0.005\t0\t8\t0\t0\tcmd 1", "line");
+    let job = job_started(new_job(2, 1, ["x"], "sleep 9"), 9, 2000000000, 0, 0);
+    expectEq(joblog_line(job_result(job, -1, 9, "", "", 1250000000)), "2\t:\t2.000\t     1.250\t0\t0\t-1\t9\tsleep 9", "stopped");
+}
+
+func test_order_buffer(): void {
+    let keep = OrderBuffer(true);
+    var printed: list[string] = [];
+    safe {
+        for (seq in [2, 3, 1, 5]) {
+            printed.push(seqs(keep.add(result(seq, [], "", ""))));
+        }
+        printed.push(seqs(keep.flush()));
+    }
+    expectEq(printed.join("|"), "||1,2,3||5", "held until their turn, the rest flushed at the end");
+    let any = OrderBuffer(false);
+    var at_once = "";
+    safe {
+        at_once = seqs(any.add(result(4, [], "", "")));
+    }
+    expectEq(at_once, "4", "without -k, at once");
+}

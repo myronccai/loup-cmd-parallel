@@ -1,0 +1,79 @@
+@mode(host.scripted)
+
+# Unit tests for parallel's halt policies (lib/halt.loup) and the number
+# helpers behind them (lib/numbers.loup).
+#
+# Runtime: host.scripted, run by the test runner: `make test` interprets
+# this file with Stage0 (`loup-bootstrap test --no-color --no-parallel
+# --file`), one test per `func test_*()`. It is not part of the program.
+
+from debug.assert import (expect, expectEq);
+from ..lib.halt import (HaltPolicy, HaltWhen, HaltOn, never_halt, parse_halt, halt_reached, counts_toward,
+    halt_notice, exit_status);
+from ..lib.numbers import (parse_whole, parse_millis, seconds3, pad_left);
+
+func policy(spec: string): HaltPolicy {
+    return parse_halt(spec).unwrap();
+}
+
+func describe(p: HaltPolicy): string {
+    let when = match p.when {
+        HaltWhen.Never => "never",
+        HaltWhen.Soon => "soon",
+        HaltWhen.Now => "now",
+    };
+    let on = match p.on {
+        HaltOn.Fail => "fail",
+        HaltOn.Success => "success",
+        HaltOn.Done => "done",
+    };
+    return i"{$ when $},{$ on $}={$ p.count $}";
+}
+
+func test_spellings(): void {
+    let spellings = ["never", "0", "1", "2", "soon,fail=3", "now,success=1", "soon,done=10"];
+    let parsed: list[string] = [describe(policy(s)) for s in spellings];
+    expectEq(parsed.join(" "), "never,fail=0 never,fail=0 soon,fail=1 now,fail=1 soon,fail=3 now,success=1 soon,done=10", "all");
+    expectEq(parse_halt("sometime,fail=1").unwrap_err(), "invalid --halt value 'sometime,fail=1' (WHEN is soon or now)", "when");
+    expectEq(parse_halt("now,crash=1").unwrap_err(), "invalid --halt value 'now,crash=1' (COND is fail, success or done)", "cond");
+    expectEq(parse_halt("now,fail=10%").unwrap_err(), "invalid --halt value 'now,fail=10%' (percentages are not supported)", "percent");
+    expectEq(parse_halt("now,fail=0").unwrap_err(), "invalid --halt value 'now,fail=0' (the count must be a positive number)", "zero");
+    expect(parse_halt("now").is_err() and parse_halt("now,fail").is_err() and parse_halt("").is_err(), "incomplete");
+}
+
+func test_reached_and_counted(): void {
+    let fail2 = policy("soon,fail=2");
+    expect(!halt_reached(fail2, 1, 5) and halt_reached(fail2, 2, 0), "two failures");
+    expect(halt_reached(policy("now,success=3"), 0, 3), "successes");
+    expect(halt_reached(policy("now,done=3"), 1, 2), "done counts both");
+    expect(!halt_reached(never_halt(), 100, 100), "never");
+    expect(counts_toward(fail2, true) and !counts_toward(fail2, false), "only failures count toward fail");
+    expect(counts_toward(policy("now,success=1"), false), "a success counts toward success");
+}
+
+func test_notice(): void {
+    expectEq(halt_notice(policy("soon,fail=1"), "exit 3", 2).join("|"),
+        "parallel: This job failed:|exit 3|parallel: Starting no more jobs. Waiting for 2 jobs to finish.", "soon");
+    expectEq(halt_notice(policy("now,success=1"), "true", 1).join("|"),
+        "parallel: This job succeeded:|true|parallel: Stopping 1 running jobs.", "now");
+    expectEq(halt_notice(policy("soon,done=1"), "x", 0).join("|"), "parallel: This job finished:|x", "nothing running");
+}
+
+func test_exit_status(): void {
+    expectEq(exit_status(never_halt(), false, 0, 0), 0, "all succeeded");
+    expectEq(exit_status(never_halt(), false, 7, 0), 7, "failed count");
+    expectEq(exit_status(never_halt(), false, 250, 0), 101, "capped");
+    expectEq(exit_status(policy("now,fail=1"), true, 1, 3), 3, "the failing job's status");
+    expectEq(exit_status(policy("now,fail=1"), true, 1, -1), 255, "a stopped job");
+    expectEq(exit_status(policy("now,success=1"), true, 4, 0), 0, "halted on success");
+    expectEq(exit_status(policy("now,done=2"), true, 1, 0), 1, "halted when done");
+}
+
+func test_numbers(): void {
+    expectEq(parse_whole("042") ?? -1, 42, "digits");
+    expect(parse_whole("") == None and parse_whole("4x") == None and parse_whole("12345678901") == None, "not whole");
+    let millis: list[int] = [parse_millis(s) ?? -1 for s in ["2", "0.25", ".5", "1.23456", ".", "1.x", "", "1.2.3"]];
+    expectEq(str(millis), "[2000, 250, 500, 1234, -1, -1, -1, -1]", "seconds");
+    expectEq(seconds3(1792562098374000000) + " " + seconds3(5000000), "1792562098.374 0.005", "three decimals");
+    expectEq(pad_left("0.005", 10) + "|" + pad_left("12345678901", 10), "     0.005|12345678901", "padded, never cut");
+}

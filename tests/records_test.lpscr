@@ -1,0 +1,61 @@
+@mode(host.scripted)
+
+# Unit tests for parallel's input records (lib/records.loup): records,
+# columns, and combining sources by product and by link.
+#
+# Runtime: host.scripted, run by the test runner: `make test` interprets
+# this file with Stage0 (`loup-bootstrap test --no-color --no-parallel
+# --file`), one test per `func test_*()`. It is not part of the program.
+
+from debug.assert import (expectEq);
+from system.regex import (Regex);
+from ..lib.records import (split_records, split_columns, expand_columns, link_groups, group_length,
+    tuple_count, tuple_at);
+
+# Every tuple of the sources, as `a1 a2 b1 ...`.
+func all_tuples(sources: list[list[string]], linked: list[bool], link_all: bool): string {
+    let groups = link_groups(linked, link_all);
+    let lengths: list[int] = [s.len() for s in sources];
+    var out: list[string] = [];
+    for (k in 0..tuple_count(lengths, groups)) {
+        out.push(tuple_at(sources, groups, k).join(""));
+    }
+    return out.join(" ");
+}
+
+func test_records(): void {
+    expectEq(split_records("a\nb\n", "\n", false).join("|"), "a|b", "final delimiter");
+    expectEq(split_records("a\nb", "\n", false).join("|"), "a|b", "no final delimiter");
+    expectEq(split_records("a\n\nb\n", "\n", false).join("|"), "a||b", "empty record kept");
+    expectEq(split_records("a\n \n\nb\n", "\n", true).join("|"), "a|b", "-r drops blank records");
+    expectEq(split_records("", "\n", false).len(), 0, "no input");
+    expectEq(split_records("x,y,", ",", false).join("|"), "x|y", "other delimiter");
+}
+
+func test_columns(): void {
+    expectEq(split_columns("a\tb\t\tc", Regex("\t")).join("|"), "a|b||c", "tabs");
+    expectEq(split_columns("one  two   three", Regex(" +")).join("|"), "one|two|three", "a regex");
+    expectEq(split_columns("abc", Regex(",*")).join("|"), "abc", "empty matches do not split");
+    expectEq(expand_columns(["a,b", "c"], Regex(",")).join("|"), "a|b|c", "every value");
+}
+
+func test_link_groups(): void {
+    expectEq(str(link_groups([false, false, false], false)), "[[0], [1], [2]]", "all separate");
+    expectEq(str(link_groups([false, true, false], false)), "[[0, 1], [2]]", ":::+");
+    expectEq(str(link_groups([false, false, false], true)), "[[0, 1, 2]]", "--link");
+    expectEq(str(link_groups([true], false)), "[[0]]", "the first source cannot be linked");
+}
+
+func test_combinations(): void {
+    expectEq(all_tuples([["a", "b"], ["1", "2", "3"]], [false, false], false), "a1 a2 a3 b1 b2 b3", "last fastest");
+    expectEq(all_tuples([["a", "b", "c"], ["1", "2"]], [false, true], false), "a1 b2 c1", "a shorter link wraps");
+    expectEq(all_tuples([["a", "b"], ["1", "2"], ["x", "y"]], [false, true, false], false), "a1x a1y b2x b2y", "a pair times a source");
+    expectEq(all_tuples([["a", "b"], ["1", "2"], ["x"]], [false, false, false], true), "a1x b2x", "--link");
+}
+
+func test_empty_sources(): void {
+    expectEq(tuple_count([2, 0], link_groups([false, false], false)), 0, "an empty source");
+    expectEq(tuple_count([2, 0], link_groups([false, true], false)), 0, "an empty linked source");
+    expectEq(tuple_count([], []), 0, "no sources");
+    expectEq(group_length([3, 1, 2], [0, 1, 2]), 3, "the longest");
+}

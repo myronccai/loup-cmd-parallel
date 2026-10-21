@@ -1,7 +1,11 @@
 # AGENTS.md
 
-This repository is a GitHub template for building a command-line application
-in the Loup programming language. The program is built as a native executable.
+This repository is `parallel`, a small GNU parallel written in the Loup
+programming language, part of the loup-cmd series of example applications.
+It is a `host.scripted` project: the program is the `.lpscr` script
+`bin/parallel.lpscr`, which `loup run` executes from source, with modules
+in `lib/` (`host.scripted` where they use async code, workers or
+`spawnBlocking`, `host.dual` otherwise). Nothing is compiled.
 
 ## Skills
 
@@ -19,93 +23,102 @@ mistakes. Load those only as needed.
 
 ```text
 .
-├── package.lppkg                # Loup manifest: name, version, toolchain, [build] entry, [test] pattern
-├── Makefile                     # run, check, test, build, ci, clean
-├── LICENSE                      # MIT license (copyright Code Craft AI LLC)
-├── source/                      # all Loup code; modules import each other by path from here
-│   ├── main.loup                # entry point: func main() calls run(runtime.args())
-│   ├── appinfo.loup             # APP_NAME, APP_VERSION, APP_SUMMARY, exit statuses
-│   ├── cli/
-│   │   ├── args.loup            # struct Options, parse_args()
-│   │   ├── usage.loup           # usage(), version_line()
-│   │   └── app.loup             # run(), dispatch(): routes commands, maps errors to exit statuses
-│   └── commands/                # one module per command
-│       └── hello.loup           # sample command: run_hello()
-├── tests/                       # tests: <module>_test.loup files with func test_*(): void
-│   ├── app_test.loup
-│   ├── args_test.loup
-│   └── hello_test.loup
-├── specs/                       # feature specs: <feature>/requirements.md, design.md, tasks.md
-│   ├── README.md
-│   └── command-line-interface/
+├── package.lppkg                # manifest: name, version, toolchain, [build] entry (bin/parallel.lpscr), [test] pattern
+├── Makefile                     # run, check, test, e2e, ci, clean
+├── bin/
+│   └── parallel.lpscr           # entry script (executable, shebang `loup run`): arguments, checks, top-level await
+├── lib/
+│   ├── scheduler.lpscr          # class Scheduler: slots (atomic {}), batches, polling, settling, halting
+│   ├── launcher.lpscr           # worker script (spawnWorker): writes N.cmd and starts the job with sh in the background
+│   ├── inputs.lpscr             # async gen argument_tuples() (for await, spawnBlocking)
+│   ├── runner.lpscr             # Tally (Atomic), JobLog (Mutex), Collector, Stopper: all Sendable
+│   ├── shell.lpscr              # class Shell (exec on both runtimes, signals), cpu_count, spool directory
+│   ├── args.loup                # struct Options, SourceSpec, parse_args(), resolve_jobs()
+│   ├── halt.loup                # HaltPolicy, parse_halt(), halt_reached(), halt_notice(), exit_status()
+│   ├── cmdline.loup             # replacement strings: build_command()
+│   ├── records.loup             # split_records(), split_columns(), link_groups(), tuple_at()
+│   ├── results.loup             # Job, JobResult, render_output(), joblog_line(), OrderBuffer
+│   ├── numbers.loup             # parse_whole(), parse_millis(), seconds3(), pad_left()
+│   ├── appinfo.loup             # APP_NAME, APP_VERSION, exit statuses, limits
+│   └── usage.loup               # usage(), version_line()
+├── tests/
+│   ├── *_test.lpscr             # unit tests: func test_*() / async func test_*()
+│   └── e2e.sh                   # end-to-end tests: runs the script with loup run
+├── specs/parallel/              # requirements.md, design.md, tasks.md
 ├── skills/loup-programmer/      # the Loup skill and its references
-├── .github/workflows/ci.yml     # installs Loup and runs `make ci`
-└── build/                       # build output (git-ignored)
+└── .github/workflows/ci.yml     # installs Loup and runs `make ci`
 ```
 
-## Build, run and test
+## Check, run and test
 
 Prerequisites: Loup 1.26.0 (`loup` and `loup-bootstrap` on `PATH`), `make`,
-and `clang` 17 or later for native builds.
+`bash`, and `sh`, `mktemp`, `setsid` and `nproc` for the jobs.
 
 Loup Lite comes from <https://github.com/code-craft-ai-company/loup-releases>;
 [README.md](README.md#installing-loup-lite) has the install commands.
 
 | Task | Command | Notes |
 |------|---------|-------|
-| Run from source | `make run ARGS="hello Ann --shout"` | `loup run source/main.loup -- ARGS` |
-| Type-check | `make check` | checks `source/main.loup` and every module it imports; tests are not checked |
-| Run all tests | `make test` | every `tests/*_test.loup` |
-| Run matching tests | `make test TEST_ARGS="--filter value"` | tests whose name contains `value` |
-| Run one test file | `make test TEST_ARGS="--file tests/args_test.loup"` | |
-| Build | `make build` | native binary at `build/myapp` |
-| Run the binary | `build/myapp --help` | |
-| Everything CI runs | `make ci` | check, test, build, then `build/myapp --version` |
-| Clean | `make clean` | removes `build/` and `.temp/` |
+| Run from source | `make run ARGS="-k echo ::: a b c"` | `loup run bin/parallel.lpscr -- ARGS` |
+| Run directly | `./bin/parallel.lpscr -- --halt now,fail=1 CMD ::: ...` | long options only after `--` |
+| Type-check | `make check` | `loup-bootstrap check` on the entry script (with its imports) and the worker script |
+| Unit tests | `make test` | each `tests/*_test.lpscr` in turn, `--no-parallel` |
+| One test file | `make test TESTS=tests/runner_test.lpscr` | |
+| Matching tests | `make test TEST_ARGS="--filter halt"` | |
+| End-to-end tests | `make e2e` | `tests/e2e.sh`: output, job log and exit status of `loup run` |
+| Everything CI runs | `make ci` | check, test, e2e, then `--version` |
+| Clean | `make clean` | removes `.temp/` (unit-test files) |
 
-Run `make ci` before reporting a change as done. `loup run` and the native
-build do not support the same things, so a change can pass `make test` and
-still fail `make build`.
+Run `make ci` before reporting a change as done. Unit tests run under Stage0
+(`loup-bootstrap`); the script runs under the self-hosted `loup run`, which
+behaves differently in places (below), so only `make e2e` shows what users
+get. The scheduler has no unit tests: `spawnWorker` fails inside Stage0's
+test runner.
 
-Do not call `loup test` or `loup check` directly on Linux x86-64. There `loup`
-is the self-hosted driver: it refuses `check`, and its test runner cannot
-resolve this project's imports. The Makefile uses `loup-bootstrap` (Stage0) for
-both, and sets `LOUPPATH=source` for tests.
+Toolchain facts this project depends on (Loup 1.26.0, Linux x86-64):
+
+- A script entry cannot be built (`E-BUILD-COMPILED`); there is no build target.
+- The interpreters run `async` bodies eagerly, `spawnBlocking` at the call
+  site, workers in batch mode (send everything, then receive) and, in the
+  self-hosted `loup run`, threads at `Thread.spawnWith` and async generators
+  to their end before the first `for await` pass. Jobs run concurrently
+  because they are background processes, not because of Loup tasks.
+- A worker script cannot import anything, and under Stage0 sees no
+  module-level constants or types: keep `lib/launcher.lpscr` to prelude
+  functions, lists and strings. `spawnWorker` paths are relative to the
+  entry script's directory (`../lib/launcher.lpscr` from `bin/`).
+- The self-hosted `loup run` passes `exec` arguments through `sh` in double
+  quotes; `Shell.prepare` escapes them. `kill` must go through `sh -c` (dash
+  takes no `--`; procps' kill reads `-PID` as an option).
+- The self-hosted `loup run` cannot catch `IoError`: check `exists`/`isDir`
+  first. It does not process escapes inside `i"..."`; Stage0 does.
+- `loup run SCRIPT --long` drops `--long`; script options go after `--`.
+- `template` is a reserved word (hence `lib/cmdline.loup`).
+- Stage0's `check` rejects `system.collections.filter` on a list of a
+  struct from another module; use a comprehension.
 
 ## Making a change
 
-1. Write or update the spec in `specs/<feature>/` (see [specs/README.md](specs/README.md)).
-2. Change the code under `source/`.
-3. Add or update tests in `tests/`.
+1. Update the spec in `specs/parallel/` (see [specs/README.md](specs/README.md)).
+2. Change the code: logic in `lib/`, top-level flow in `bin/parallel.lpscr`.
+3. Add or update unit tests in `tests/` and cases in `tests/e2e.sh`.
 4. Run `make ci`.
-5. Tick the finished tasks in `specs/<feature>/tasks.md`.
-
-To add a command:
-
-1. Create `source/commands/<name>.loup` with `@mode(host.dual)` and
-   `pub func run_<name>(opts: Options): int`, returning an exit status from
-   `appinfo`.
-2. Add an arm for it to `dispatch` in `source/cli/app.loup`.
-3. Describe it in `usage()` in `source/cli/usage.loup`.
-4. Add any new options to `Options` and `parse_args` in `source/cli/args.loup`.
-5. Add `tests/<name>_test.loup`.
+5. Tick the finished tasks in `specs/parallel/tasks.md`.
 
 ## Conventions
 
-- Every source file is `@mode(host.dual)` with the `.loup` extension. Only
-  `source/main.loup` has a `main()`.
-- Modules import each other by path from `source/`:
-  `from cli.args import (Options);`. Tests import them the same way. Do not
-  use relative imports (`from .args import ...`): the self-hosted `loup run`
-  on Linux x86-64 fails on them.
-- Struct fields read from another module must be `pub`.
-- The native build supports less than `loup run` does. For example,
-  `list.is_empty()` fails native codegen (`E-CODEGEN-UNHANDLED-METHOD`); use
-  `len() == 0`.
-- Keep `APP_VERSION` in `source/appinfo.loup` equal to `version` in
+- `bin/parallel.lpscr` is `@mode(host.scripted)` with a `#!/usr/bin/env -S
+  loup run` line and the executable bit.
+- `lib/*.loup` are `@mode(host.dual)`: declarations only, no `Any`; data
+  types live there so script and dual modules can share them. `lib/*.lpscr`
+  hold everything that needs `async`, workers or `spawnBlocking`.
+- Imports are relative: `from ..lib.x import (...)` in `bin/` and `tests/`,
+  `from .x import (...)` inside `lib/`.
+- Build each struct through a factory in its defining module
+  (`new_job`, `values_source`, `make_fill`).
+- Classes shared with threads implement `Sendable`: `let` fields only, with
+  shared state in an `Atomic` or `Mutex`.
+- Never delete recursively: the spool is emptied file by file and removed
+  with `rmdir`.
+- Keep `APP_VERSION` in `lib/appinfo.loup` equal to `version` in
   `package.lppkg`.
-- The skill's examples use the `loup init` layout (`src/`, `tests/`, and
-  `from ..src.x import` in tests). This project uses `source/` and
-  `tests/` with plain imports; follow this file.
-- The skill documents toolchain 1.25.1; this template targets 1.26.0. When
-  they disagree, trust the toolchain's behaviour.

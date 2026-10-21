@@ -1,0 +1,64 @@
+@mode(host.scripted)
+
+# Unit tests for parallel's replacement strings (lib/cmdline.loup): every
+# {...} form, positional values, quoting, -q, appended values, and the
+# braces that must stay as written.
+#
+# Runtime: host.scripted, run by the test runner: `make test` interprets
+# this file with Stage0 (`loup-bootstrap test --no-color --no-parallel
+# --file`), one test per `func test_*()`. It is not part of the program.
+
+from debug.assert import (expect, expectEq);
+from ..lib.cmdline import (Fill, make_fill, expand_word, build_command);
+
+func fill1(value: string): Fill {
+    return make_fill([value], 7, 2, true);
+}
+
+func line(words: list[string], fill: Fill): string {
+    return build_command(words, fill, false);
+}
+
+func test_whole_input_and_numbers(): void {
+    expectEq(line(["cp", "{}", "{}.bak"], fill1("x")), "cp x x.bak", "{} twice, inside a word");
+    expectEq(line(["echo", "{#}", "{%}", "job-{#}.log"], fill1("x")), "echo 7 2 job-7.log", "sequence and slot");
+}
+
+func test_path_forms(): void {
+    let f = fill1("dir.d/sub/file.tar.gz");
+    expectEq(line(["{.}", "{/}", "{//}", "{/.}"], f), "dir.d/sub/file.tar file.tar.gz dir.d/sub file.tar", "forms");
+    expectEq(line(["{//}"], fill1("plain")), ".", "no directory");
+    expectEq(line(["{.}"], fill1("dir.d/noext")), "dir.d/noext", "a dot in the directory only");
+}
+
+func test_positional_values(): void {
+    let f = make_fill(["a/b.c", "two words"], 1, 1, true);
+    expectEq(line(["echo", "{2}", "{1}"], f), "echo 'two words' a/b.c", "reordered and quoted");
+    expectEq(line(["echo", "{1/.}", "{1//}", "{1.}", "{1/}"], f), "echo b a a/b b.c", "with suffixes");
+    expectEq(line(["echo", "{}"], f), "echo a/b.c 'two words'", "{} is every value");
+    expectEq(line(["echo", "{3}"], f), "echo {3} a/b.c 'two words'", "{3} stays and the values are appended");
+}
+
+func test_quoting(): void {
+    expectEq(line(["echo", "{}"], fill1("it's $HOME")), "echo 'it'\\''s $HOME'", "quoted for sh");
+    expectEq(line(["echo", "{}"], fill1("")), "echo ''", "empty value");
+    expectEq(line(["echo {} | wc -c"], fill1("a b")), "echo 'a b' | wc -c", "the command itself is not quoted");
+    let raw = make_fill(["it's"], 1, 1, false);
+    expectEq(build_command(["printf", "%s\\n", "<{}>"], raw, true), "printf '%s\\n' '<it'\\''s>'", "-q quotes words");
+    expectEq(build_command(["echo", "a b"], raw, true), "echo 'a b' 'it'\\''s'", "-q appends quoted values");
+}
+
+func test_appending_and_no_command(): void {
+    expectEq(line(["gzip", "-9"], fill1("a b.txt")), "gzip -9 'a b.txt'", "one value appended");
+    expectEq(line(["echo"], make_fill(["1", "2"], 1, 1, true)), "echo 1 2", "every value");
+    expectEq(line([], fill1("echo hi; exit 3")), "echo hi; exit 3", "the input is the command");
+}
+
+func test_braces_left_alone(): void {
+    let (awk, found) = expand_word("{print $1}", fill1("x"));
+    expect(awk == "{print $1}" and !found, "an awk program");
+    let (open, _) = expand_word("a{b", fill1("x"));
+    expectEq(open, "a{b", "an unclosed brace");
+    let (_, dotted) = expand_word("x{.}", fill1("x"));
+    expect(dotted, "{.} is one");
+}

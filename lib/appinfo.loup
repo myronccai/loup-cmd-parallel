@@ -1,0 +1,28 @@
+@mode(host.dual)
+
+# parallel's identity and fixed numbers: name, version, exit statuses and
+# limits shared by the entry script and the library modules.
+#
+# Runtime: host.dual, but only ever interpreted here: bin/parallel.lpscr and
+# the lib/ modules import it under `loup run`, and the unit tests under
+# Stage0's test runner (`loup-bootstrap test`). It holds constants only, so
+# it would compile natively as well.
+
+pub const APP_NAME: string = "parallel";
+pub const APP_VERSION: string = "0.1.0";
+pub const APP_SUMMARY: string = "run shell commands in parallel, one per input";
+
+# GNU parallel's exit statuses: 0 when every job succeeded, the number of
+# failed jobs up to 101, and 255 for every other error (usage included).
+pub const EXIT_OK: int = 0;
+pub const EXIT_MAX_FAILED: int = 101;
+pub const EXIT_ERROR: int = 255;
+
+# `-j 0` asks for as many slots as possible; GNU parallel stops at what its
+# file handles allow, this program at a fixed number.
+pub const MAX_SLOTS: int = 250;
+
+# How often the scheduler looks for finished jobs, and how long a stopped
+# job gets between TERM and KILL.
+pub const POLL_MS: int = 10;
+pub const KILL_GRACE_MS: int = 200;

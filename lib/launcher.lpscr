@@ -1,0 +1,80 @@
+@mode(host.scripted)
+
+# parallel's launcher: the worker script that starts jobs in the background.
+#
+# Runtime: host.scripted. The scheduler (lib/scheduler.lpscr) starts it with
+# `spawnWorker("../lib/launcher.lpscr")`, a path relative to the directory of
+# the entry script bin/parallel.lpscr, sends it one message per job and
+# receives one reply per job. In Loup 1.26 a worker runs in batch mode: the
+# first `receive()` runs workerMain over every message sent so far. A worker
+# cannot import modules, and under Stage0 it sees no module-level constants
+# or types, so this file uses prelude functions, lists and strings only.
+# tests/launcher_test.lpscr imports its functions as an ordinary module.
+#
+# Messages are list[string]: [seq, slot, spool, command, rewrites, setsid],
+# the last two "1" or "0". Replies are [seq, pid, error], error "" on success.
+
+# Runs one job as `sh -c WRAPPER job SPOOL SEQ SLOT`: the command file with
+# its output in SEQ.out and SEQ.err, then `$?` into SEQ.tmp, renamed to
+# SEQ.rc so that a reader never sees a half-written status.
+pub func job_wrapper(): string {
+    return "PARALLEL_SEQ=$2 PARALLEL_JOBSLOT=$3 sh \"$1/$2.cmd\" > \"$1/$2.out\" 2> \"$1/$2.err\" < /dev/null; "
+        + "echo $? > \"$1/$2.tmp\"; mv \"$1/$2.tmp\" \"$1/$2.rc\"";
+}
+
+# Puts the wrapper in the background, detached from our pipes, and prints
+# its PID: `sh -c STARTER parallel SETSID WRAPPER SPOOL SEQ SLOT`. SETSID is
+# `setsid` (a process group of its own, so stopping the job reaches every
+# process in it) or empty, and then expands to nothing.
+pub func starter(): string {
+    return "$1 sh -c \"$2\" job \"$3\" \"$4\" \"$5\" > /dev/null 2>&1 < /dev/null & echo $!";
+}
+
+pub func launch_argv(spool: string, seq: string, slot: string, setsid: bool): list[string] {
+    let prefix = if (setsid) { "setsid" } else { "" };
+    return ["sh", "-c", starter(), "parallel", prefix, job_wrapper(), spool, seq, slot];
+}
+
+# The same escape as lib/shell.lpscr's (a worker cannot import it): under the
+# self-hosted `loup run`, exec's arguments pass through `sh` in double quotes.
+pub func escape_argv(argv: list[string]): list[string] {
+    var out: list[string] = [];
+    for (word in argv) {
+        out.push(word.replace("\\", "\\\\").replace("\"", "\\\"").replace("$", "\\$").replace("`", "\\`"));
+    }
+    return out;
+}
+
+# Field `at` of a message. Messages arrive as `Any`, so the parameter is
+# left untyped and cast here.
+func field(message, at: int): string {
+    let fields = message as list[string];
+    return fields[at];
+}
+
+# Writes the job's command file and starts it; returns the reply.
+pub func start_job(message): list[string] {
+    let seq = field(message, 0);
+    let spool = field(message, 2);
+    writeText(spool + "/" + seq + ".cmd", field(message, 3) + "\n");
+    var argv = launch_argv(spool, seq, field(message, 1), field(message, 5) == "1");
+    if (field(message, 4) == "1") {
+        argv = escape_argv(argv);
+    }
+    let r = exec(argv);
+    let pid = r.stdout.decode().trim();
+    if (r.exit_code != 0 or pid.len() == 0) {
+        return [seq, "", "cannot start job " + seq + ": " + r.stderr.decode().trim()];
+    }
+    return [seq, pid, ""];
+}
+
+pub async func workerMain(channel: WorkerChannel): Task[void] {
+    while (true) {
+        let message = await channel.receive();
+        if (message == None) {
+            break;
+        }
+        channel.reply(start_job(message));
+    }
+}

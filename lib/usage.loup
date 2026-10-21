@@ -1,0 +1,60 @@
+@mode(host.dual)
+
+# parallel's --help and --version text.
+#
+# Runtime: host.dual, but only ever interpreted here: bin/parallel.lpscr
+# imports it under `loup run`, and tests/args_test.lpscr under Stage0's test
+# runner. It builds strings only, so it would compile natively as well.
+
+from .appinfo import (APP_NAME, APP_VERSION, APP_SUMMARY);
+
+pub func version_line(): string {
+    return i"{$ APP_NAME $} (loup-cmd-{$ APP_NAME $}) {$ APP_VERSION $}";
+}
+
+pub func usage(): string {
+    let lines: list[string] = [
+        i"usage: {$ APP_NAME $} [OPTION]... [COMMAND [ARG]...] [::: ARG... | :::: FILE...]...",
+        "",
+        "Run COMMAND once per input, several jobs at a time (" + APP_SUMMARY + ").",
+        "Inputs come from the ::: lists and :::: files after the command, from -a",
+        "files, or from standard input, one per line. Several sources give one job",
+        "per combination; :::+ and ::::+ (or --link) take sources side by side.",
+        "",
+        "Replacement strings in COMMAND (values are quoted for the shell):",
+        "  {}    the input            {.}   without extension   {/}  basename",
+        "  {//}  directory            {/.}  basename without extension",
+        "  {#}   job sequence number  {%}   job slot number",
+        "  {N} {N.} {N/} {N//} {N/.}  the N-th value (input source or column)",
+        "Without a replacement string the values are appended to COMMAND; without",
+        "COMMAND the inputs are the commands.",
+        "",
+        "Options:",
+        "  -j, -P, --jobs N        run N jobs at a time: N, +N, -N or N% of the",
+        "                          CPUs, 0 for as many as possible (default 100%)",
+        "  -k, --keep-order        print the output of jobs in input order",
+        "      --halt WHEN,COND=N  stop after N failed, succeeded or finished jobs:",
+        "                          WHEN is soon or now, COND fail, success or done;",
+        "                          never (default), 0, 1 or 2 also work",
+        "      --joblog FILE       write a tab-separated line per job to FILE",
+        "      --dry-run           print the commands instead of running them",
+        "      --tag               start every output line with the job's values",
+        "  -v                      print each command before its output",
+        "  -t, --verbose           print each command on standard error as it starts",
+        "  -q, --quote             quote the command words for the shell",
+        "  -a, --arg-file FILE     read inputs from FILE (- is standard input)",
+        "  -0, --null              inputs are separated by NUL, not newline",
+        "  -C, --colsep REGEX      split every input into columns at REGEX",
+        "  -r, --no-run-if-empty   skip empty inputs",
+        "      --link, --xapply    take all input sources side by side",
+        "      --timeout SECS      stop jobs that run longer than SECS",
+        "      --tmpdir DIR        keep job output under DIR (default $TMPDIR or /tmp)",
+        "  -h, --help              show this help and exit",
+        "  -V, --version           show the version and exit",
+        "",
+        "Exit status: 0 if every job succeeded, else the number of failed jobs (at",
+        "most 101); with --halt on failures, the failing job's exit value; 255 on",
+        "errors. Under `loup run`, long options must follow a first `--`.",
+    ];
+    return lines.join("\n");
+}

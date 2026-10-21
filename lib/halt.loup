@@ -1,0 +1,139 @@
+@mode(host.dual)
+
+# parallel's halt policies (--halt): when a run stops early, what it says,
+# and the exit status it ends with.
+#
+# Runtime: host.dual, but only ever interpreted here: lib/args.loup and
+# lib/scheduler.lpscr import it under `loup run`, and tests/halt_test.lpscr
+# under Stage0's test runner. Plain enums, a struct and pure functions.
+
+from .numbers import (parse_whole);
+from .appinfo import (APP_NAME, EXIT_OK, EXIT_MAX_FAILED, EXIT_ERROR);
+
+# soon: start no more jobs, let the running ones finish. now: stop them too.
+pub enum HaltWhen {
+    Never,
+    Soon,
+    Now,
+}
+
+pub enum HaltOn {
+    Fail,
+    Success,
+    Done,
+}
+
+pub struct HaltPolicy {
+    pub when: HaltWhen;
+    pub on: HaltOn;
+    pub count: int;
+}
+
+# The default: every job runs, whatever happens.
+pub func never_halt(): HaltPolicy {
+    return HaltPolicy(when = HaltWhen.Never, on = HaltOn.Fail, count = 0);
+}
+
+func make_policy(when: HaltWhen, on: HaltOn, count: int): HaltPolicy {
+    return HaltPolicy(when = when, on = on, count = count);
+}
+
+# Parses GNU parallel's --halt values: `never`, `soon,fail=3`,
+# `now,success=1`, `now,done=10`, and the old numeric forms 0, 1 and 2.
+pub func parse_halt(spec: string): Result[HaltPolicy, string] {
+    let bad = i"invalid --halt value '{$ spec $}'";
+    match spec {
+        "1" => { return Ok(make_policy(HaltWhen.Soon, HaltOn.Fail, 1)); },
+        "2" => { return Ok(make_policy(HaltWhen.Now, HaltOn.Fail, 1)); },
+        _ => {},
+    }
+    if (spec == "never" or spec == "0") {
+        return Ok(never_halt());
+    }
+    let parts = spec.split(",");
+    if (parts.len() != 2) {
+        return Err(bad);
+    }
+    let when = match parts[0] {
+        "soon" => HaltWhen.Soon,
+        "now" => HaltWhen.Now,
+        _ => HaltWhen.Never,
+    };
+    if (when == HaltWhen.Never) {
+        return Err(bad + " (WHEN is soon or now)");
+    }
+    let condition = parts[1].split("=");
+    if (condition.len() != 2) {
+        return Err(bad);
+    }
+    let on: HaltOn? = match condition[0] {
+        "fail" => Some(HaltOn.Fail),
+        "success" => Some(HaltOn.Success),
+        "done" => Some(HaltOn.Done),
+        _ => None,
+    };
+    if (on == None) {
+        return Err(bad + " (COND is fail, success or done)");
+    }
+    if (condition[1].endsWith("%")) {
+        return Err(bad + " (percentages are not supported)");
+    }
+    match parse_whole(condition[1]) {
+        Some(n) if (n > 0) => { return Ok(make_policy(when, on.unwrap(), n)); },
+        _ => { return Err(bad + " (the count must be a positive number)"); },
+    }
+}
+
+# True once the jobs counted so far meet the policy's condition.
+pub func halt_reached(policy: HaltPolicy, failed: int, succeeded: int): bool {
+    if (policy.when == HaltWhen.Never) {
+        return false;
+    }
+    let counted = match policy.on {
+        HaltOn.Fail => failed,
+        HaltOn.Success => succeeded,
+        HaltOn.Done => failed + succeeded,
+    };
+    return counted >= policy.count;
+}
+
+# Whether the job that just ended can trigger the policy: a success never
+# triggers `fail=N`, nor a failure `success=N`.
+pub func counts_toward(policy: HaltPolicy, job_failed: bool): bool {
+    return match policy.on {
+        HaltOn.Fail => job_failed,
+        HaltOn.Success => !job_failed,
+        HaltOn.Done => true,
+    };
+}
+
+# The lines printed on standard error when the policy triggers: messages
+# start with the program name, the job's command line stands alone, as in
+# GNU parallel. `running` is the number of jobs still running.
+pub func halt_notice(policy: HaltPolicy, command: string, running: int): list[string] {
+    let verb = match policy.on {
+        HaltOn.Fail => "failed",
+        HaltOn.Success => "succeeded",
+        HaltOn.Done => "finished",
+    };
+    var lines = [i"{$ APP_NAME $}: This job {$ verb $}:", command];
+    if (policy.when == HaltWhen.Soon and running > 0) {
+        lines.push(i"{$ APP_NAME $}: Starting no more jobs. Waiting for {$ running $} jobs to finish.");
+    }
+    if (policy.when == HaltWhen.Now and running > 0) {
+        lines.push(i"{$ APP_NAME $}: Stopping {$ running $} running jobs.");
+    }
+    return lines;
+}
+
+# The run's exit status. `trigger_exit` is the exit value of the job that
+# triggered the halt (-1 for a job this program stopped).
+pub func exit_status(policy: HaltPolicy, halted: bool, failed: int, trigger_exit: int): int {
+    if (halted and policy.on == HaltOn.Fail) {
+        return if (trigger_exit < 0) { EXIT_ERROR } else { trigger_exit };
+    }
+    if (halted and policy.on == HaltOn.Success) {
+        return EXIT_OK;
+    }
+    return if (failed > EXIT_MAX_FAILED) { EXIT_MAX_FAILED } else { failed };
+}

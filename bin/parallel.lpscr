@@ -1,0 +1,92 @@
+#!/usr/bin/env -S loup run
+@mode(host.scripted)
+
+# parallel: run a shell command once per input, several jobs at a time,
+# like a small GNU parallel.
+#
+# Runtime: host.scripted. The program's entry point: the Loup scripted
+# runtime interprets this file from source (`loup run bin/parallel.lpscr --
+# ARGS`, as `make run`, tests/e2e.sh and CI do; on Linux x86-64 that is the
+# self-hosted driver). Its top-level statements run in order and there is
+# no compile step: a script entry cannot be compiled, so the project has no
+# binary. `make check` type-checks it, with every lib/ module it imports,
+# using Stage0 (`loup-bootstrap check`). Long options must follow `--`:
+# `loup run` drops a `--long` word that comes before it.
+#
+# Structure: parse the command line (usage errors exit 255), --help and
+# --version, check the input files, set up the run (runtime quirks, slots,
+# job log, spool directory) and await the scheduler at the top level; the
+# spool directory is removed in a `finally` block whatever happens.
+
+from io.fs import (isDir);
+from ..lib.appinfo import (APP_NAME, EXIT_OK, EXIT_ERROR);
+from ..lib.args import (Options, parse_args, input_files, resolve_jobs);
+from ..lib.usage import (usage, version_line);
+from ..lib.shell import (detect_shell, cpu_count, make_spool, remove_spool);
+from ..lib.runner import (JobLog, open_joblog);
+from ..lib.scheduler import (Scheduler);
+
+# Ends the run on an error that is not the user's command line.
+func fail(message: string): noreturn {
+    printErr(i"{$ APP_NAME $}: {$ message $}");
+    exit(EXIT_ERROR);
+    throw ValueError(message);
+}
+
+let parsed = parse_args(args());
+if (parsed.is_err()) {
+    printErr(i"{$ APP_NAME $}: {$ parsed.unwrap_err() $}");
+    printErr(i"Try '{$ APP_NAME $} --help' for more information.");
+    exit(EXIT_ERROR);
+}
+let opts: Options = parsed.unwrap();
+if (opts.help) {
+    println(usage());
+    exit(EXIT_OK);
+}
+if (opts.version) {
+    println(version_line());
+    exit(EXIT_OK);
+}
+
+# Input files are checked before any job starts: under the self-hosted
+# `loup run` an IoError from readText cannot be caught.
+for (path in input_files(opts)) {
+    if (path == "-") {
+        continue;
+    }
+    if (!exists(path)) {
+        fail(i"cannot open input file '{$ path $}': No such file or directory");
+    }
+    if (isDir(path)) {
+        fail(i"cannot open input file '{$ path $}': Is a directory");
+    }
+}
+
+let shell = detect_shell();
+let slots = resolve_jobs(opts.jobs, cpu_count(shell)).unwrap();
+var joblog = JobLog("");
+var spool = "";
+if (!opts.dry_run) {
+    match open_joblog(opts.joblog) {
+        Ok(log) => { joblog = log; },
+        Err(message) => { fail(message); },
+    }
+    match make_spool(shell, opts.tmpdir) {
+        Ok(path) => { spool = path; },
+        Err(message) => { fail(message); },
+    }
+}
+
+var status = EXIT_ERROR;
+try {
+    let scheduler = Scheduler(opts, slots, shell, spool, joblog);
+    safe {
+        status = await scheduler.run();
+    }
+} finally {
+    if (spool != "") {
+        remove_spool(shell, spool);
+    }
+}
+exit(status);

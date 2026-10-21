@@ -1,0 +1,130 @@
+@mode(host.scripted)
+
+# parallel's access to processes: running commands with `exec` the same way
+# under both Loup runtimes, signalling a job's process group, counting CPUs,
+# and the spool directory that holds the output of running jobs.
+#
+# Runtime: host.scripted. A module of the script bin/parallel.lpscr,
+# interpreted with it by `loup run`; tests/shell_test.lpscr runs it under
+# Stage0's test runner. Every call here starts a process with `exec`.
+
+from io.fs import (isDir, listDir, remove);
+from core.string_utils import (isDigits);
+
+# The self-hosted `loup run` hands `exec` arguments to `sh` inside double
+# quotes, where `\`, `"`, `$` and a backquote keep a special meaning. A
+# backslash before each makes the shell give back the text exactly.
+pub func escape_for_double_quotes(text: string): string {
+    return text.replace("\\", "\\\\").replace("\"", "\\\"").replace("$", "\\$").replace("`", "\\`");
+}
+
+# How this runtime runs processes. Only `let` fields of Sendable types, so
+# the threads that stop jobs may share one Shell.
+pub class Shell implements Sendable {
+    # True under the self-hosted `loup run`: arguments need the escape above.
+    pub let rewrites_arguments: bool;
+    # True when `setsid` exists: each job then runs in its own process
+    # group, and stopping it reaches every process it started.
+    pub let has_setsid: bool;
+
+    new(rewrites_arguments: bool, has_setsid: bool) {
+        this.rewrites_arguments = rewrites_arguments;
+        this.has_setsid = has_setsid;
+    }
+
+    # `argv` as this runtime's `exec` must receive it to run `argv`.
+    pub func prepare(argv: list[string]): list[string] {
+        if (!this.rewrites_arguments) {
+            return argv;
+        }
+        var out: list[string] = [];
+        for (word in argv) {
+            out.push(escape_for_double_quotes(word));
+        }
+        return out;
+    }
+
+    pub func status(argv: list[string]): int {
+        let r = exec(this.prepare(argv));
+        return r.exit_code;
+    }
+
+    # Standard output of `argv` (with its final newline), or None when it
+    # fails.
+    pub func output(argv: list[string]): string? {
+        let r = exec(this.prepare(argv));
+        if (r.exit_code != 0) {
+            return None;
+        }
+        return Some(r.stdout.decode());
+    }
+
+    # The target of `kill` for job `pid`: its process group when jobs get one.
+    func target(pid: int): string {
+        return if (this.has_setsid) { "-" + str(pid) } else { str(pid) };
+    }
+
+    # Sends SIGNAL (a name such as TERM) to the job; false if nothing got it.
+    # The shell's own `kill` does it: the self-hosted runtime runs every
+    # command through `sh` and so gets dash's builtin, which takes no `--`,
+    # while procps' /usr/bin/kill (what Stage0 runs) reads `-PID` as an option.
+    pub func signal_job(pid: int, signal: string): bool {
+        let line = "kill -" + signal + " " + this.target(pid) + " 2> /dev/null";
+        return this.status(["sh", "-c", line]) == 0;
+    }
+
+    # True while any process of the job is still there.
+    pub func job_alive(pid: int): bool {
+        return this.signal_job(pid, "0");
+    }
+}
+
+# Looks at the runtime once: under the self-hosted `loup run`, `printf %s
+# '\$'` prints `$`, because its shell has already consumed the backslash.
+pub func detect_shell(): Shell {
+    let probe = exec(["printf", "%s", "\\$"]);
+    let rewrites = probe.stdout.decode() == "$";
+    let setsid = exec(["sh", "-c", "command -v setsid"]).exit_code == 0;
+    return Shell(rewrites, setsid);
+}
+
+# The number of CPUs this process may use (`nproc`), or 1.
+pub func cpu_count(shell: Shell): int {
+    let digits = (shell.output(["nproc"]) ?? "").trim();
+    return if (isDigits(digits) and digits.toInt() > 0) { digits.toInt() } else { 1 };
+}
+
+# Creates the spool directory under `tmpdir` (--tmpdir, else $TMPDIR, else
+# /tmp) and returns its path.
+pub func make_spool(shell: Shell, tmpdir: string): Result[string, string] {
+    let base = if (tmpdir == "") { env("TMPDIR") ?? "/tmp" } else { tmpdir };
+    if (!isDir(base)) {
+        return Err(i"cannot keep temporary files in '{$ base $}': not a directory");
+    }
+    match shell.output(["mktemp", "-d", base + "/parallel.XXXXXX"]) {
+        Some(path) => { return Ok(path.trim()); },
+        None => { return Err(i"cannot create a temporary directory in '{$ base $}'"); },
+    }
+}
+
+# True for the names of the files a job leaves in the spool: `7.out`.
+pub func is_spool_file(name: string): bool {
+    let dot = name.index_of(".");
+    let known = ["cmd", "out", "err", "tmp", "rc"];
+    return dot > 0 and isDigits(name.slice(0, dot)) and known.contains(name.slice(dot + 1));
+}
+
+# Removes the spool directory: the job files one by one, then the directory
+# itself with `rmdir`, which refuses anything still in it. Nothing is ever
+# deleted recursively.
+pub func remove_spool(shell: Shell, spool: string): void {
+    if (!isDir(spool)) {
+        return;
+    }
+    for (name in listDir(spool)) {
+        if (is_spool_file(name)) {
+            remove(spool + "/" + name);
+        }
+    }
+    shell.status(["rmdir", spool]);
+}

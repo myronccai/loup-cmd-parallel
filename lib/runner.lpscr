@@ -1,0 +1,156 @@
+@mode(host.scripted)
+
+# parallel's job bookkeeping: the counters, the job log, collecting a
+# finished job from the spool, and stopping a running one.
+#
+# Runtime: host.scripted. A module of the script bin/parallel.lpscr,
+# interpreted with it by `loup run`; tests/runner_test.lpscr runs it under
+# Stage0's test runner. Collectors run on a ThreadPool and stoppers on their
+# own threads (lib/scheduler.lpscr), so every class here is Sendable: only
+# `let` fields, and the shared state behind an Atomic or a Mutex.
+
+from io.fs import (appendText, isDir, remove);
+from io.path import (dirname);
+from system.time import (monotonicNs);
+from core.time import (Duration);
+from core.waiting import (waitForItSync, WaitContext);
+from .appinfo import (POLL_MS, KILL_GRACE_MS);
+from .results import (Job, JobResult, job_result, job_failed, joblog_header, joblog_line);
+from .shell import (Shell);
+
+# The spool file of job `seq` with extension `ext` (cmd, out, err, tmp, rc).
+pub func spool_file(spool: string, seq: int, ext: string): string {
+    return i"{$ spool $}/{$ seq $}.{$ ext $}";
+}
+
+# True once the job's wrapper has published its exit status.
+pub func job_finished(spool: string, seq: int): bool {
+    return exists(spool_file(spool, seq, "rc"));
+}
+
+# How many jobs started, succeeded, failed and were stopped. The collector
+# and stopper threads count while the scheduler reads.
+pub class Tally implements Sendable {
+    pub let started: Atomic[int] = Atomic.new(0);
+    pub let succeeded: Atomic[int] = Atomic.new(0);
+    pub let failed: Atomic[int] = Atomic.new(0);
+    pub let stopped: Atomic[int] = Atomic.new(0);
+}
+
+# The --joblog file. Lines come from several threads (collectors and
+# stoppers), so each append happens under the mutex, whose value counts the
+# lines written. An empty path means no job log.
+pub class JobLog implements Sendable {
+    pub let path: string;
+    let lines: Mutex[int] = Mutex.new(0);
+
+    new(path: string) {
+        this.path = path;
+    }
+
+    pub func record(r: JobResult): void {
+        if (this.path == "") {
+            return;
+        }
+        let line = joblog_line(r) + "\n";
+        this.lines.withLock(func(g: MutexGuard[int]): void {
+            appendText(this.path, line);
+            g.set(g.get() + 1);
+        });
+    }
+
+    pub func written(): int {
+        return this.lines.withLock(func(g: MutexGuard[int]) => g.get());
+    }
+}
+
+# Creates (or empties) the job log and writes its header line.
+pub func open_joblog(path: string): Result[JobLog, string] {
+    if (path == "") {
+        return Ok(JobLog(""));
+    }
+    let parent = dirname(path);
+    if (isDir(path) or !isDir(parent)) {
+        let why = if (isDir(path)) { "Is a directory" } else { "No such file or directory" };
+        return Err(i"cannot write the job log '{$ path $}': {$ why $}");
+    }
+    writeText(path, joblog_header() + "\n");
+    return Ok(JobLog(path));
+}
+
+func read_or_empty(path: string): string {
+    return if (exists(path)) { readText(path) } else { "" };
+}
+
+# Turns a job that has ended (or was stopped) into its result: reads its
+# output and status, removes its spool files, writes its job log line and
+# counts it.
+pub class Collector implements Sendable {
+    pub let spool: string;
+    pub let joblog: JobLog;
+    pub let tally: Tally;
+
+    new(spool: string, joblog: JobLog, tally: Tally) {
+        this.spool = spool;
+        this.joblog = joblog;
+        this.tally = tally;
+    }
+
+    # `signal` is 0 for a job that ended by itself, else the signal that
+    # stopped it; a stopped job's exit value is -1.
+    pub func collect(job: Job, signal: int): JobResult {
+        let end = monotonicNs();
+        let out = read_or_empty(spool_file(this.spool, job.seq, "out"));
+        let err = read_or_empty(spool_file(this.spool, job.seq, "err"));
+        let status = read_or_empty(spool_file(this.spool, job.seq, "rc")).trim();
+        let exitval = if (signal == 0) { status.toInt() } else { -1 };
+        for (ext in ["cmd", "out", "err", "tmp", "rc"]) {
+            let path = spool_file(this.spool, job.seq, ext);
+            if (exists(path)) {
+                remove(path);
+            }
+        }
+        let r = job_result(job, exitval, signal, out, err, end);
+        this.joblog.record(r);
+        if (job_failed(r)) {
+            this.tally.failed.fetchAdd(1);
+        } else {
+            this.tally.succeeded.fetchAdd(1);
+        }
+        return r;
+    }
+}
+
+# Stops a running job: TERM to its process group, then KILL when it is
+# still there after the grace period.
+pub class Stopper implements Sendable {
+    pub let shell: Shell;
+    pub let spool: string;
+    pub let tally: Tally;
+
+    new(shell: Shell, spool: string, tally: Tally) {
+        this.shell = shell;
+        this.spool = spool;
+        this.tally = tally;
+    }
+
+    # The signal that ended the job, or 0 when it had ended by itself first.
+    pub func stop(job: Job): int {
+        if (job_finished(this.spool, job.seq)) {
+            return 0;
+        }
+        this.shell.signal_job(job.pid, "TERM");
+        var signal = 15;
+        try {
+            waitForItSync(func(edits ctx: WaitContext): bool { return !this.shell.job_alive(job.pid); },
+                i"job {$ job.seq $} to stop", Duration.ofSeconds(0), Duration.ofMillis(POLL_MS),
+                Duration.ofMillis(KILL_GRACE_MS));
+        } catch (TimeoutError as e) {
+            # It ignored TERM: KILL cannot be ignored.
+            this.shell.signal_job(job.pid, "KILL");
+            signal = 9;
+        }
+        this.tally.stopped.fetchAdd(1);
+        return signal;
+    }
+}

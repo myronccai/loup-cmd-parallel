@@ -1,0 +1,301 @@
+@mode(host.scripted)
+
+# parallel's scheduler: takes the value tuples from the input generator,
+# turns them into jobs, starts them through the launcher worker, waits for
+# them in the spool, prints their output and applies the halt policy.
+#
+# Runtime: host.scripted. A module of the script bin/parallel.lpscr,
+# interpreted with it by `loup run`. It is covered by tests/e2e.sh, not by
+# unit tests: `spawnWorker` fails inside Stage0's test runner.
+#
+# Structure: run() is the main loop. Each tuple becomes a Job holding a
+# slot (reserve_slot); jobs gather in a batch until no slot is free, then
+# start_batch hands it to a launcher worker. wait_for_any polls the spool;
+# settle collects finished jobs on a ThreadPool and stops overdue ones on
+# threads; report prints results and applies the halt policy. The jobs are
+# separate processes: Loup's tasks, workers and threads organise the waiting.
+
+from core.time import (Duration);
+from core.waiting import (WaitGate, waitForItSync, WaitContext);
+from system.time import (monotonicNs, realtimeNs);
+from system.collections import (partition, countWhere);
+from .appinfo import (APP_NAME, POLL_MS, EXIT_ERROR);
+from .args import (Options);
+from .halt import (HaltWhen, halt_reached, counts_toward, halt_notice, exit_status);
+from .cmdline import (make_fill, build_command);
+from .results import (Job, JobResult, new_job, job_started, job_overdue, job_failed, render_output, OrderBuffer);
+from .runner import (Tally, JobLog, Collector, Stopper, job_finished);
+from .shell import (Shell);
+from .inputs import (InputRules, input_rules, argument_tuples);
+
+# The worker script, relative to the entry script's directory (bin/).
+const LAUNCHER: string = "../lib/launcher.lpscr";
+
+# waitForItSync needs a limit; a job may run for days, so take a year.
+const HOURS_IN_A_YEAR: int = 24 * 365;
+
+func flag(on: bool): string {
+    return if (on) { "1" } else { "0" };
+}
+
+pub class Scheduler {
+    let opts: Options;
+    let shell: Shell;
+    let spool: string;
+    let tally: Tally;
+    let collector: Collector;
+    let stopper: Stopper;
+    # Set once the halt policy is met: no job starts after that.
+    let halt: WaitGate;
+    var busy: list[bool] = [];
+    var running: list[Job] = [];
+    var order: OrderBuffer;
+    var next_seq: int = 1;
+    var trigger_exit: int = 0;
+    var launch_error: string = "";
+
+    new(opts: Options, slots: int, shell: Shell, spool: string, joblog: JobLog) {
+        this.opts = opts;
+        this.shell = shell;
+        this.spool = spool;
+        this.tally = Tally();
+        this.collector = Collector(spool, joblog, this.tally);
+        this.stopper = Stopper(shell, spool, this.tally);
+        this.halt = WaitGate(Some("halt"), None);
+        this.order = OrderBuffer(opts.keep_order);
+        for (k in 0..slots) {
+            this.busy.push(false);
+        }
+    }
+
+    func free_slots(): int {
+        return countWhere(this.busy, func(taken: bool): bool { return !taken; });
+    }
+
+    # Takes the lowest free slot ({%} counts from 1). Callers make sure one
+    # is free.
+    modifier async func reserve_slot(): Task[int] {
+        var slot = 0;
+        atomic {
+            # No suspension point between finding the slot and taking it:
+            # once tasks interleave, another one could take it in between.
+            while (this.busy[slot]) {
+                slot += 1;
+            }
+            this.busy[slot] = true;
+        }
+        return slot + 1;
+    }
+
+    modifier func release_slot(slot: int): void {
+        this.busy[slot - 1] = false;
+    }
+
+    # The job for the next tuple, with its command line.
+    modifier func next_job(values: list[string], slot: int): Job {
+        let seq = this.next_seq;
+        this.next_seq += 1;
+        let fill = make_fill(values, seq, slot, !this.opts.quote);
+        let command = build_command(this.opts.command, fill, this.opts.quote);
+        return new_job(seq, slot, values, command);
+    }
+
+    # Starts a batch of jobs with one launcher worker: every job is sent,
+    # then every reply received, as batch-mode workers require.
+    modifier async func start_batch(batch: list[Job]): Task[void] {
+        if (batch.len() == 0) {
+            return;
+        }
+        if (this.halt.isSet() or this.launch_error != "") {
+            for (job in batch) {
+                this.release_slot(job.slot);
+            }
+            return;
+        }
+        let worker = await spawnWorker(LAUNCHER);
+        for (job in batch) {
+            if (this.opts.verbose) {
+                printErr(job.command);
+            }
+            worker.send([str(job.seq), str(job.slot), this.spool, job.command,
+                flag(this.shell.rewrites_arguments), flag(this.shell.has_setsid)]);
+        }
+        let wall = realtimeNs();
+        let mono = monotonicNs();
+        for (job in batch) {
+            let reply = await worker.receive();
+            if (reply == None) {
+                this.launch_error = "the launcher worker stopped early";
+                this.release_slot(job.slot);
+                continue;
+            }
+            let fields = reply as list[string];
+            if (fields[2] != "") {
+                this.launch_error = fields[2];
+                this.release_slot(job.slot);
+                continue;
+            }
+            this.running.push(job_started(job, fields[1].toInt(), wall, mono, this.opts.timeout_ms));
+            this.tally.started.fetchAdd(1);
+        }
+        await worker.join();
+    }
+
+    # The running jobs that have ended or run past their --timeout.
+    func ready_jobs(): list[Job] {
+        let now = monotonicNs();
+        let ready: list[Job] = [job for job in this.running if job_finished(this.spool, job.seq) or job_overdue(job, now)];
+        return ready;
+    }
+
+    # Stops jobs, one thread each so that their grace periods overlap, and
+    # collects them.
+    func stop_jobs(jobs: list[Job]): list[JobResult] {
+        let stopper = this.stopper;
+        let collector = this.collector;
+        var handles: list[ThreadHandle[JobResult]] = [];
+        for (job in jobs) {
+            handles.push(Thread.spawnWith(func(): JobResult {
+                let signal = stopper.stop(job);
+                return collector.collect(job, signal);
+            }));
+        }
+        var results: list[JobResult] = [];
+        for (h in handles) {
+            results.push(h.join());
+        }
+        return results;
+    }
+
+    modifier func forget(r: JobResult): void {
+        let still: list[Job] = [job for job in this.running if job.seq != r.seq];
+        this.running = still;
+        this.release_slot(r.slot);
+    }
+
+    func print_result(r: JobResult): void {
+        let (out, err) = render_output(r, this.opts.tag, this.opts.print_command);
+        if (out.len() > 0) {
+            print(out);
+        }
+        # printErr ends the line itself.
+        if (err.len() > 0) {
+            printErr(if (err.endsWith("\n")) { err.slice(0, err.len() - 1) } else { err });
+        }
+    }
+
+    # Prints a result (when its turn comes) and applies the halt policy.
+    modifier func report(r: JobResult): void {
+        var printable: list[JobResult] = [];
+        safe {
+            printable = this.order.add(r);
+        }
+        for (ready in printable) {
+            this.print_result(ready);
+        }
+        let policy = this.opts.halt;
+        if (this.halt.isSet() or !counts_toward(policy, job_failed(r))) {
+            return;
+        }
+        if (!halt_reached(policy, this.tally.failed.load(), this.tally.succeeded.load())) {
+            return;
+        }
+        safe {
+            this.halt.set();
+        }
+        this.trigger_exit = r.exitval;
+        for (line in halt_notice(policy, r.command, this.running.len())) {
+            printErr(line);
+        }
+        if (policy.when == HaltWhen.Now) {
+            let stopped = this.stop_jobs(this.running);
+            for (s in stopped) {
+                this.forget(s);
+            }
+            for (s in stopped) {
+                this.report(s);
+            }
+        }
+    }
+
+    # Collects the jobs that are ready: finished ones on a thread pool (each
+    # reads and removes its own files), overdue ones through stop_jobs.
+    modifier async func settle(ready: list[Job]): Task[void] {
+        let spool = this.spool;
+        let (finished, overdue) = partition(ready, func(job: Job): bool { return job_finished(spool, job.seq); });
+        var results: list[JobResult] = [];
+        if (finished.len() > 0) {
+            let pool = ThreadPool.new(finished.len());
+            let collector = this.collector;
+            for (job in finished) {
+                let r: JobResult = pool.run(func(): JobResult { return collector.collect(job, 0); });
+                results.push(r);
+            }
+            pool.shutdown();
+        }
+        for (r in this.stop_jobs(overdue)) {
+            results.push(r);
+        }
+        for (r in results) {
+            this.forget(r);
+        }
+        for (r in results) {
+            this.report(r);
+        }
+    }
+
+    # Waits until at least one running job has ended or is overdue, then
+    # settles what is ready.
+    modifier async func wait_for_any(): Task[void] {
+        var ready: list[Job] = [];
+        waitForItSync(func(edits ctx: WaitContext): bool {
+            nonlocal ready;
+            ready = this.ready_jobs();
+            return ready.len() > 0;
+        }, "a job to finish", Duration.ofSeconds(0), Duration.ofMillis(POLL_MS), Duration.ofHours(HOURS_IN_A_YEAR));
+        await this.settle(ready);
+    }
+
+    # Runs every job and returns the exit status.
+    pub modifier async func run(): Task[int] {
+        let rules = input_rules(this.opts.delimiter, this.opts.skip_empty, this.opts.colsep, this.opts.link);
+        var batch: list[Job] = [];
+        for await (values in argument_tuples(this.opts.sources, rules)) {
+            if (this.halt.isSet() or this.launch_error != "") {
+                break;
+            }
+            if (this.opts.dry_run) {
+                let slot = (this.next_seq - 1) % this.busy.len() + 1;
+                println(this.next_job(values, slot).command);
+                continue;
+            }
+            let slot = await this.reserve_slot();
+            batch.push(this.next_job(values, slot));
+            # A batch ends when the slots run out; then wait for a slot to
+            # come free again.
+            if (this.free_slots() == 0) {
+                await this.start_batch(batch);
+                batch = [];
+                while (this.free_slots() == 0 and this.running.len() > 0) {
+                    await this.wait_for_any();
+                }
+            }
+        }
+        await this.start_batch(batch);
+        while (this.running.len() > 0) {
+            await this.wait_for_any();
+        }
+        var held: list[JobResult] = [];
+        safe {
+            held = this.order.flush();
+        }
+        for (r in held) {
+            this.print_result(r);
+        }
+        if (this.launch_error != "") {
+            printErr(i"{$ APP_NAME $}: {$ this.launch_error $}");
+            return EXIT_ERROR;
+        }
+        return exit_status(this.opts.halt, this.halt.isSet(), this.tally.failed.load(), this.trigger_exit);
+    }
+}

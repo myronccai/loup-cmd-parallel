@@ -1,5 +1,2 @@
-# Build output
-/build/
-
-# Loup toolchain scratch files (partial IR from failed native builds)
+# Loup toolchain scratch files, and the files the unit tests write
 /.temp/

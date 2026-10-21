@@ -1,0 +1,130 @@
+@mode(host.dual)
+
+# parallel's inputs: splitting text into input records and columns, and
+# combining several input sources into the value tuples of the jobs.
+#
+# Runtime: host.dual, but only ever interpreted here: lib/args.loup and
+# lib/inputs.lpscr import it under `loup run`, and tests/records_test.lpscr
+# under Stage0's test runner. system.regex is written in Loup, so the module
+# stays compilable.
+#
+# Sources combine like an odometer: job k's position in each group of
+# linked sources is a digit of k in a mixed radix whose last digit (the
+# last group) turns fastest.
+
+from system.regex import (Regex);
+
+# The records of `text`: the pieces between delimiters. A delimiter at the
+# very end does not start an empty record; with `skip_empty`, records that
+# are empty or blank are dropped (-r).
+pub func split_records(text: string, delim: string, skip_empty: bool): list[string] {
+    var records: list[string] = [];
+    if (text.len() == 0) {
+        return records;
+    }
+    let pieces = text.split(delim);
+    let last = pieces.len() - 1;
+    for (k in 0..pieces.len()) {
+        let piece = pieces[k];
+        if (k == last and piece.len() == 0) {
+            break;
+        }
+        if (skip_empty and piece.trim().len() == 0) {
+            continue;
+        }
+        records.push(piece);
+    }
+    return records;
+}
+
+# `value` cut at every match of `colsep`. Empty matches are ignored, so a
+# pattern such as ` *` cannot split between every character.
+pub func split_columns(value: string, colsep: Regex): list[string] {
+    var columns: list[string] = [];
+    var start = 0;
+    for (m in colsep.findAll(value)) {
+        if (m.end == m.start) {
+            continue;
+        }
+        columns.push(value.slice(start, m.start));
+        start = m.end;
+    }
+    columns.push(value.slice(start));
+    return columns;
+}
+
+# Every value of a job's tuple split into columns, all in one list.
+pub func expand_columns(values: list[string], colsep: Regex): list[string] {
+    var out: list[string] = [];
+    for (value in values) {
+        for (column in split_columns(value, colsep)) {
+            out.push(column);
+        }
+    }
+    return out;
+}
+
+# Groups of source indexes that are read side by side: a linked source
+# joins the group of the source before it; --link links them all.
+pub func link_groups(linked: list[bool], link_all: bool): list[list[int]] {
+    var groups: list[list[int]] = [];
+    for (k in 0..linked.len()) {
+        if (k > 0 and (linked[k] or link_all)) {
+            groups[groups.len() - 1].push(k);
+        } else {
+            groups.push([k]);
+        }
+    }
+    return groups;
+}
+
+# The number of positions in a group: its longest source, or 0 when one of
+# its sources is empty (an empty source gives no jobs).
+pub func group_length(lengths: list[int], group: list[int]): int {
+    var longest = 0;
+    for (source in group) {
+        if (lengths[source] == 0) {
+            return 0;
+        }
+        if (lengths[source] > longest) {
+            longest = lengths[source];
+        }
+    }
+    return longest;
+}
+
+# How many jobs the sources give: the product of the group lengths.
+pub func tuple_count(lengths: list[int], groups: list[list[int]]): int {
+    if (groups.len() == 0) {
+        return 0;
+    }
+    var count = 1;
+    for (group in groups) {
+        count *= group_length(lengths, group);
+    }
+    return count;
+}
+
+# The values of job number `k` (from 0). Within a group a shorter source
+# wraps around (`position % its length`).
+pub func tuple_at(sources: list[list[string]], groups: list[list[int]], k: int): list[string] {
+    let lengths: list[int] = [values.len() for values in sources];
+    var positions: list[int] = [0 for group in groups];
+    # The digits of k, last group first; there is always at least one group.
+    var rest = k;
+    var g = groups.len();
+    do {
+        g -= 1;
+        let size = group_length(lengths, groups[g]);
+        positions[g] = rest % size;
+        rest = rest / size;
+    } while (g > 0);
+    var tuple: list[string] = [];
+    for (gi in 0..groups.len()) {
+        for (source in groups[gi]) {
+            let values = sources[source];
+            tuple.push(values[positions[gi] % values.len()]);
+        }
+    }
+    return tuple;
+}

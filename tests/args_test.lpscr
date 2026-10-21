@@ -1,0 +1,116 @@
+@mode(host.scripted)
+
+# Unit tests for parallel's command-line parser (lib/args.loup) and its help
+# text (lib/usage.loup): defaults, spellings, sources, --jobs, usage errors.
+#
+# Runtime: host.scripted, run by the test runner: `make test` interprets
+# this file with Stage0 (`loup-bootstrap test --no-color --no-parallel
+# --file`), one test per `func test_*()`, importing lib/ with relative
+# imports. It is not part of the program.
+
+from debug.assert import (expect, expectEq);
+from ..lib.args import (Options, SourceSpec, Origin, parse_args, resolve_jobs, input_files, is_separator);
+from ..lib.halt import (HaltWhen, HaltOn);
+from ..lib.usage import (usage, version_line);
+
+func ok(argv: list[string]): Options {
+    return parse_args(argv).unwrap();
+}
+
+func err(argv: list[string]): string {
+    return match parse_args(argv) {
+        Ok(_) => "parsed",
+        Err(message) => message,
+    };
+}
+
+# The sources as text: `values:a,b file+:-` (`+` when linked).
+func sources(o: Options): string {
+    var parts: list[string] = [];
+    for (s in o.sources) {
+        let link = if (s.linked) { "+" } else { "" };
+        match s.origin {
+            Origin.Values(items) => { parts.push("values" + link + ":" + items.join(",")); },
+            Origin.File(path) => { parts.push("file" + link + ":" + path); },
+        }
+    }
+    return parts.join(" ");
+}
+
+func test_defaults_read_standard_input(): void {
+    let o = ok([]);
+    expectEq(o.jobs, "100%", "one job per CPU");
+    expect(!o.keep_order and !o.dry_run and !o.tag and !o.quote, "flags off");
+    expectEq(o.delimiter, "\n", "newline-separated");
+    expectEq(o.command.len(), 0, "no command");
+    expectEq(sources(o), "file:-", "standard input");
+    expect(o.halt.when == HaltWhen.Never, "never halts");
+}
+
+func test_command_and_sources(): void {
+    let o = ok(["-k", "gzip", "-9", ":::", "a.txt", "b.txt"]);
+    expect(o.keep_order, "-k");
+    expectEq(o.command.join(" "), "gzip -9", "options after the command belong to it");
+    expectEq(sources(o), "values:a.txt,b.txt", "one source");
+    let many = ok(["echo", ":::", "a", ":::+", "1", "2", "::::", "x.txt", "y.txt", "::::+", "z.txt"]);
+    expectEq(sources(many), "values:a values+:1,2 file:x.txt file:y.txt file+:z.txt", "in order");
+    expectEq(input_files(many).join(","), "x.txt,y.txt,z.txt", "files to check");
+    expectEq(sources(ok(["-a", "l.txt", "--arg-file=-", "echo", ":::", "x"])), "file:l.txt file:- values:x", "-a first");
+    expectEq(sources(ok(["echo", ":::"])), "values:", "an empty source");
+    expectEq(ok([":::", "echo a"]).command.len(), 0, "no command: the inputs are the commands");
+}
+
+func test_short_options(): void {
+    let o = ok(["-j4", "-kvtq", "-0", "-r", "-C", "\\t", "-P", "+2", "cmd"]);
+    expectEq(o.jobs, "+2", "the last --jobs wins");
+    expect(o.keep_order and o.print_command and o.verbose and o.quote, "combined flags");
+    expectEq(o.delimiter, str(char.of(0)), "-0 is NUL");
+    expect(o.skip_empty, "-r");
+    expectEq(o.colsep, "\\t", "--colsep regex kept as written");
+    expectEq(o.command.join(" "), "cmd", "command");
+}
+
+func test_long_options(): void {
+    let o = ok(["--jobs", "2", "--keep-order", "--halt=now,fail=2", "--joblog", "log.tsv", "--dry-run",
+        "--tag", "--verbose", "--quote", "--null", "--no-run-if-empty", "--xapply", "--timeout=1.5",
+        "--tmpdir", "/var/tmp", "--max-procs=3"]);
+    expectEq(o.jobs, "3", "--max-procs overrides --jobs");
+    expect(o.keep_order and o.dry_run and o.tag and o.verbose and o.quote and o.skip_empty and o.link, "flags");
+    expect(o.halt.when == HaltWhen.Now and o.halt.on == HaltOn.Fail and o.halt.count == 2, "halt policy");
+    expectEq(o.joblog + " " + o.tmpdir, "log.tsv /var/tmp", "file names");
+    expectEq(o.timeout_ms, 1500, "timeout in milliseconds");
+    let dashed = ok(["-k", "--", "-v", ":::", "x"]);
+    expect(!dashed.print_command and dashed.command.join(" ") == "-v", "-- ends the options");
+}
+
+func test_usage_errors(): void {
+    expectEq(err(["--bogus"]), "unrecognized option '--bogus'", "unknown long");
+    expectEq(err(["-kx"]), "invalid option -- 'x'", "unknown in a cluster");
+    expectEq(err(["-j"]), "option requires an argument -- 'j'", "missing short value");
+    expectEq(err(["--joblog"]), "option '--joblog' requires an argument", "missing long value");
+    expectEq(err(["--tag=yes"]), "option '--tag' doesn't allow an argument", "flag with a value");
+    expectEq(err(["-j", "many"]), "invalid --jobs value 'many'", "bad jobs");
+    expectEq(err(["--timeout", "0"]), "invalid --timeout value '0'", "zero timeout");
+    expectEq(err(["--timeout", "soon"]), "invalid --timeout value 'soon'", "not a number");
+    expectEq(err(["--halt", "later"]), "invalid --halt value 'later'", "bad halt");
+    expectEq(err(["--colsep", "("]), "invalid --colsep regular expression '('", "bad regex");
+    expectEq(err(["echo", "::::"]), "missing file name after '::::'", "no file");
+    expect(is_separator("::::+") and !is_separator("::") and !is_separator(":::::"), "separators");
+}
+
+func test_resolve_jobs(): void {
+    expectEq(resolve_jobs("3", 8).unwrap(), 3, "plain");
+    expectEq(resolve_jobs("+2", 8).unwrap(), 10, "more than the CPUs");
+    expectEq(resolve_jobs("-3", 8).unwrap(), 5, "fewer than the CPUs");
+    expectEq(resolve_jobs("-9", 8).unwrap(), 1, "never below one");
+    expectEq(resolve_jobs("50%", 8).unwrap(), 4, "percentage");
+    expectEq(resolve_jobs("0", 8).unwrap(), 250, "as many as possible");
+    expectEq(resolve_jobs("9999", 8).unwrap(), 250, "capped");
+    expect(resolve_jobs("x%", 8).is_err(), "bad percentage");
+}
+
+func test_usage_and_version(): void {
+    expectEq(version_line(), "parallel (loup-cmd-parallel) 0.1.0", "version");
+    expect(usage().startsWith("usage: parallel [OPTION]..."), "first line");
+    expect(usage().contains("--halt WHEN,COND=N"), "documents --halt");
+}

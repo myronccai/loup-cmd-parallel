@@ -1,0 +1,56 @@
+@mode(host.scripted)
+
+# Unit tests for parallel's input generator (lib/inputs.lpscr), consumed
+# with `for await` as the scheduler does.
+#
+# Runtime: host.scripted, run by the test runner: `make test` interprets
+# this file with Stage0 (`loup-bootstrap test --no-color --no-parallel
+# --file`); the test functions are `async`, so they can `await`. Input files
+# are written under .temp/tests/. It is not part of the program.
+
+from debug.assert import (expectEq);
+from io.fs import (createDir, writeText);
+from ..lib.args import (SourceSpec, values_source, file_source);
+from ..lib.inputs import (InputRules, input_rules, argument_tuples);
+
+func scratch(name: string, text: string): SourceSpec {
+    createDir(".temp/tests");
+    writeText(".temp/tests/" + name, text);
+    return file_source(".temp/tests/" + name, false);
+}
+
+func plain(): InputRules {
+    return input_rules("\n", false, "", false);
+}
+
+# Every tuple the generator yields, as `a|1;b|2`.
+async func tuples(sources: list[SourceSpec], rules: InputRules): Task[string] {
+    var out: list[string] = [];
+    for await (tuple in argument_tuples(sources, rules)) {
+        out.push(tuple.join("|"));
+    }
+    return out.join(";");
+}
+
+async func test_argument_lists(): Task[void] {
+    let ab = values_source(["a", "b"], false);
+    expectEq(await tuples([ab, values_source(["1", "2"], false)], plain()), "a|1;a|2;b|1;b|2", "product");
+    expectEq(await tuples([values_source(["a", "b", "c"], false), values_source(["1"], true)], plain()), "a|1;b|1;c|1", ":::+");
+    expectEq(await tuples([ab, values_source(["1", "2"], false)], input_rules("\n", false, "", true)), "a|1;b|2", "--link");
+    expectEq(await tuples([values_source([], false), ab], plain()), "", "an empty list gives no jobs");
+}
+
+async func test_files(): Task[void] {
+    let names = scratch("names.txt", "one\ntwo words\n\nthree\n");
+    expectEq(await tuples([names], plain()), "one;two words;;three", "lines");
+    expectEq(await tuples([names], input_rules("\n", true, "", false)), "one;two words;three", "-r");
+    expectEq(await tuples([scratch("hosts.txt", "h1\nh2\n"), values_source(["x", "y"], false)], plain()),
+        "h1|x;h1|y;h2|x;h2|y", "a file and a list");
+    expectEq(await tuples([scratch("empty.txt", "")], plain()), "", "an empty file");
+}
+
+async func test_null_records_and_columns(): Task[void] {
+    let nul = str(char.of(0));
+    let table = scratch("table.txt", "a,1" + nul + "b,2" + nul);
+    expectEq(await tuples([table], input_rules(nul, false, ",", false)), "a|1;b|2", "NUL records, comma columns");
+}

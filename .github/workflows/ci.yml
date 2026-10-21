@@ -6,7 +6,7 @@ on:
   pull_request:
 
 jobs:
-  build:
+  test:
     runs-on: ubuntu-latest
     env:
       # Keep in step with `loup` in package.lppkg.
@@ -21,16 +21,10 @@ jobs:
           echo "$HOME/.loup/bin" >> "$GITHUB_PATH"
 
       - name: Show toolchain
-        run: |
-          loup --version
-          clang --version
+        run: loup --version
 
-      - name: Check, test and build
+      # The program is a script: there is nothing to build. `make ci`
+      # type-checks it, runs the unit tests (which start real processes),
+      # and runs the script with `loup run` against the end-to-end cases.
+      - name: Check, unit tests and end-to-end tests
         run: make ci
-
-      - name: Upload binary
-        uses: actions/upload-artifact@v4
-        with:
-          name: myapp-linux-x86_64
-          path: build/myapp
-          if-no-files-found: error

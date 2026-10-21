@@ -1,0 +1,56 @@
+@mode(host.dual)
+
+# parallel's number helpers: strict parsing of counts and durations from the
+# command line, and the fixed-point seconds of the job log.
+#
+# Runtime: host.dual, but only ever interpreted here: lib/args.loup,
+# lib/halt.loup and lib/results.loup import it under `loup run` and Stage0's
+# test runner. Digits are parsed by hand (`toInt` gives 0 for bad text), so
+# the module stays compilable.
+
+# A whole number written with digits only ("007" is 7), or None. At most ten
+# digits, far from overflow.
+pub func parse_whole(text: string): int? {
+    if (text.len() == 0 or text.len() > 10) {
+        return None;
+    }
+    var value = 0;
+    for (ch in text) {
+        let digit = "0123456789".index_of(ch);
+        if (digit < 0) {
+            return None;
+        }
+        value = value * 10 + digit;
+    }
+    return Some(value);
+}
+
+# Seconds as written ("2", "0.25", ".5") in whole milliseconds, or None.
+# Digits past the third decimal are dropped.
+pub func parse_millis(text: string): int? {
+    let parts = text.split(".");
+    if (parts.len() > 2 or text == "." or text.len() == 0) {
+        return None;
+    }
+    let whole = if (parts[0] == "") { Some(0) } else { parse_whole(parts[0]) };
+    var fraction = if (parts.len() == 2) { parts[1] } else { "" };
+    if (whole == None or (fraction != "" and parse_whole(fraction) == None)) {
+        return None;
+    }
+    # Exactly three digits: ".5" is 500 ms.
+    fraction = (fraction + "000").slice(0, 3);
+    return Some(whole.unwrap() * 1000 + (parse_whole(fraction) ?? 0));
+}
+
+# Nanoseconds as seconds with three decimals, as GNU parallel's job log
+# prints them: 1234567890 is "1.234".
+pub func seconds3(nanos: int): string {
+    let millis = nanos / 1000000;
+    let fraction = str(1000 + millis % 1000).slice(1);
+    return str(millis / 1000) + "." + fraction;
+}
+
+# `text` right-aligned in `width` columns (never cut).
+pub func pad_left(text: string, width: int): string {
+    return if (text.len() >= width) { text } else { " ".repeat(width - text.len()) + text };
+}
